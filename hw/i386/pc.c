@@ -639,11 +639,45 @@ static unsigned int pc_apic_id_limit(unsigned int max_cpus)
     return x86_cpu_apic_id_from_index(max_cpus - 1) + 1;
 }
 
+struct pc_bios_post_init {
+    Notifier post_init;
+    void *fw_cfg;
+};
+static struct pc_bios_post_init post_init;
+
+/* Add the ACPI and SMBIOS tables after all the hardware has been initialized.
+ * This gives devices a chance to add to those tables.
+ */
+static void pc_bios_post_initfn(Notifier *n, void *opaque)
+{
+    struct pc_bios_post_init *p = container_of(n, struct pc_bios_post_init,
+                                               post_init);
+    uint8_t *smbios_tables, *smbios_anchor;
+    size_t smbios_tables_len, smbios_anchor_len;
+    FWCfgState *fw_cfg = p->fw_cfg;
+
+    smbios_tables = smbios_get_table_legacy(&smbios_tables_len);
+    if (smbios_tables) {
+        fw_cfg_add_bytes(fw_cfg, FW_CFG_SMBIOS_ENTRIES,
+                         smbios_tables, smbios_tables_len);
+    }
+
+    smbios_get_tables(&smbios_tables, &smbios_tables_len,
+                      &smbios_anchor, &smbios_anchor_len);
+    if (smbios_anchor) {
+        fw_cfg_add_file(fw_cfg, "etc/smbios/smbios-tables",
+                        smbios_tables, smbios_tables_len);
+        fw_cfg_add_file(fw_cfg, "etc/smbios/smbios-anchor",
+                        smbios_anchor, smbios_anchor_len);
+    }
+
+    fw_cfg_add_bytes(fw_cfg, FW_CFG_ACPI_TABLES,
+                     acpi_tables, acpi_tables_len);
+}
+
 static FWCfgState *bochs_bios_init(void)
 {
     FWCfgState *fw_cfg;
-    uint8_t *smbios_tables, *smbios_anchor;
-    size_t smbios_tables_len, smbios_anchor_len;
     uint64_t *numa_fw_cfg;
     int i, j;
     unsigned int apic_id_limit = pc_apic_id_limit(max_cpus);
@@ -666,24 +700,8 @@ static FWCfgState *bochs_bios_init(void)
     fw_cfg_add_i16(fw_cfg, FW_CFG_MAX_CPUS, (uint16_t)apic_id_limit);
     fw_cfg_add_i32(fw_cfg, FW_CFG_ID, 1);
     fw_cfg_add_i64(fw_cfg, FW_CFG_RAM_SIZE, (uint64_t)ram_size);
-    fw_cfg_add_bytes(fw_cfg, FW_CFG_ACPI_TABLES,
-                     acpi_tables, acpi_tables_len);
     fw_cfg_add_i32(fw_cfg, FW_CFG_IRQ0_OVERRIDE, kvm_allows_irq0_override());
 
-    smbios_tables = smbios_get_table_legacy(&smbios_tables_len);
-    if (smbios_tables) {
-        fw_cfg_add_bytes(fw_cfg, FW_CFG_SMBIOS_ENTRIES,
-                         smbios_tables, smbios_tables_len);
-    }
-
-    smbios_get_tables(&smbios_tables, &smbios_tables_len,
-                      &smbios_anchor, &smbios_anchor_len);
-    if (smbios_anchor) {
-        fw_cfg_add_file(fw_cfg, "etc/smbios/smbios-tables",
-                        smbios_tables, smbios_tables_len);
-        fw_cfg_add_file(fw_cfg, "etc/smbios/smbios-anchor",
-                        smbios_anchor, smbios_anchor_len);
-    }
 
     fw_cfg_add_bytes(fw_cfg, FW_CFG_E820_TABLE,
                      &e820_reserve, sizeof(e820_reserve));
@@ -713,6 +731,10 @@ static FWCfgState *bochs_bios_init(void)
     fw_cfg_add_bytes(fw_cfg, FW_CFG_NUMA, numa_fw_cfg,
                      (1 + apic_id_limit + nb_numa_nodes) *
                      sizeof(*numa_fw_cfg));
+
+    post_init.fw_cfg = fw_cfg;
+    post_init.post_init.notify = pc_bios_post_initfn;
+    qemu_add_machine_init_done_notifier(&post_init.post_init);
 
     return fw_cfg;
 }
