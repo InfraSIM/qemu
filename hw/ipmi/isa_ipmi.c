@@ -23,6 +23,8 @@
  */
 #include "hw/hw.h"
 #include "hw/isa/isa.h"
+#include "hw/acpi/acpi-elements.h"
+#include "hw/acpi/acpi.h"
 #include "hw/i386/pc.h"
 #include "qemu/timer.h"
 #include "sysemu/char.h"
@@ -39,6 +41,8 @@ typedef struct ISAIPMIDevice {
     char *interface;
     int intftype;
     uint32_t iobase;
+    uint32_t iolength;
+    uint8_t regspacing;
     int32 isairq;
     uint8_t slave_addr;
     uint8_t version;
@@ -57,6 +61,143 @@ struct smbios_type_38 {
     uint8_t base_address_modifier;
     uint8_t interrupt_number;
 } QEMU_PACKED;
+
+static int
+acpi_ipmi_crs_ops(char **data, int dlen, void *opaque)
+{
+    ISAIPMIDevice *info = opaque;
+    int len, rv;
+    uint8_t regspacing = info->regspacing;
+
+    if (regspacing == 1) {
+        regspacing = 0;
+    }
+
+    /* IO(Decode16, x, y, z, c) */
+    len = acpi_add_IO16(data, dlen, info->iobase,
+                        info->iobase + info->iolength - 1,
+                        regspacing, info->iolength);
+    if (len < 0) {
+        return len;
+    }
+
+    if (info->isairq) {
+        /* Interrupt(ResourceConsumer,Level,ActiveHigh,Exclusive) {n} */
+        rv = acpi_add_Interrupt(data, dlen, info->isairq,
+                                ACPI_RESOURCE_CONSUMER,
+                                ACPI_INTERRUPT_MODE_LEVEL,
+                                ACPI_INTERRUPT_POLARITY_ACTIVE_HIGH,
+                                ACPI_INTERRUPT_EXCLUSIVE);
+        if (rv < 0) {
+            return rv;
+        }
+        len += rv;
+    }
+    rv = acpi_add_EndResource(data, dlen);
+    if (rv < 0) {
+        return rv;
+    }
+    len += rv;
+    return len;
+}
+
+static int
+acpi_ipmi_crs(char **data, int dlen, void *opaque)
+{
+    ISAIPMIDevice *info = opaque;
+    int len;
+
+    len = acpi_add_BufferOp(NULL, 0, acpi_ipmi_crs_ops, info);
+    if (len < 0) {
+        return len;
+    }
+    if (len <= dlen) {
+        acpi_add_BufferOp(data, dlen, acpi_ipmi_crs_ops, info);
+    }
+    return len;
+}
+
+static int
+acpi_ipmi_dev(char **data, int dlen, void *opaque)
+{
+    ISAIPMIDevice *info = opaque;
+    int len, rv;
+    char *name;
+    uint64_t val;
+
+    name = g_strdup_printf("ipmi_%s", info->interface);
+
+    /* Name(_HID, EISAID("IPI0001")) */
+    len = acpi_add_Name(data, dlen, "_HID", acpi_add_EISAID,
+                        (void *) "IPI0001");
+    if (len < 0) {
+        return len;
+    }
+    /* Name(_STR, Unicode("ipmi_xxx")) */
+    rv = acpi_add_Name(data, dlen, "_STR", acpi_add_Unicode, name);
+    if (rv < 0) {
+        return rv;
+    }
+    len += rv;
+    val = 0;
+    /* Name(_UID, 0) */
+    rv = acpi_add_Name(data, dlen, "_UID", acpi_add_Integer, &val);
+    if (rv < 0) {
+        return rv;
+    }
+    len += rv;
+    /* Name(_CRS, ResourceTemplate() { */
+    rv = acpi_add_Name(data, dlen, "_CRS", acpi_ipmi_crs, info);
+    if (rv < 0) {
+        return rv;
+    }
+    len += rv;
+    val = info->intftype;
+    /* Method(_IFT) { Return(i) } */
+    rv = acpi_add_Method(data, dlen, "_IFT", 0, acpi_add_Return, &val);
+    if (rv < 0) {
+        return rv;
+    }
+    len += rv;
+    val = ((info->version & 0xf0) << 4) | (info->version & 0x0f);
+    /* Method(_SRV) { Return(version) } */
+    rv = acpi_add_Method(data, dlen, "_SRV", 0, acpi_add_Return, &val);
+    if (rv < 0) {
+        return rv;
+    }
+    len += rv;
+    return len;
+}
+
+static int
+acpi_ipmi_scope(char **data, int dlen, void *opaque)
+{
+    ISAIPMIDevice *info = opaque;
+
+    /* Device(MI0) { */
+    return acpi_add_Device(data, dlen, "MI0", acpi_ipmi_dev, info);
+    /* } */
+}
+
+static void
+ipmi_encode_acpi(ISAIPMIDevice *info)
+{
+    char ipmitable[200];
+    char *tblptr = ipmitable;
+    int rc;
+    Error *err = NULL;
+
+    /* Scope(\_SB.PCI0.ISA) { */
+    rc = acpi_add_Scope(&tblptr, sizeof(ipmitable), "\\_SB.PCI0.ISA",
+                         acpi_ipmi_scope, info);
+    /* } */
+    if (rc < 0) {
+        fprintf(stderr, "Unable to format IPMI ACPI table entry\n");
+        return;
+    }
+
+    acpi_append_to_table("SSDT", ipmitable, rc, &err);
+}
 
 static void ipmi_encode_smbios(void *opaque)
 {
@@ -79,6 +220,8 @@ static void ipmi_encode_smbios(void *opaque)
     smb38.interrupt_number = info->isairq;
     smbios_table_entry_add((struct smbios_structure_header *) &smb38,
                            sizeof(smb38), true);
+
+    ipmi_encode_acpi(info);
 }
 
 static void ipmi_isa_realizefn(DeviceState *dev, Error **errp)
@@ -110,6 +253,7 @@ static void ipmi_isa_realizefn(DeviceState *dev, Error **errp)
     intfk = IPMI_INTERFACE_GET_CLASS(intf);
     bmc->intf = intf;
     intf->bmc = bmc;
+    ipmi->regspacing = 1;
     intf->io_base = ipmi->iobase;
     intf->slave_addr = ipmi->slave_addr;
     ipmi->intftype = intfk->smbios_type;
@@ -118,6 +262,7 @@ static void ipmi_isa_realizefn(DeviceState *dev, Error **errp)
     if (*errp) {
         return;
     }
+    ipmi->iolength = intf->io_length;
     ipmi_bmc_init(bmc, errp);
     if (*errp) {
         return;
