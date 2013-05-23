@@ -78,33 +78,16 @@ static int acpi_checksum(const uint8_t *data, int len)
     return (-sum) & 0xff;
 }
 
-
-/* Install a copy of the ACPI table specified in @blob.
- *
- * If @has_header is set, @blob starts with the System Description Table Header
- * structure. Otherwise, "dfl_hdr" is prepended. In any case, each header field
- * is optionally overwritten from @hdrs.
- *
- * It is valid to call this function with
- * (@blob == NULL && bloblen == 0 && !has_header).
- *
- * @hdrs->file and @hdrs->data are ignored.
- *
- * SIZE_MAX is considered "infinity" in this function.
- *
- * The number of tables that can be installed is not limited, but the 16-bit
- * counter at the beginning of "acpi_tables" wraps around after UINT16_MAX.
- */
-static void acpi_table_install(const char unsigned *blob, size_t bloblen,
-                               bool has_header,
-                               const struct AcpiTableOptions *hdrs,
-                               Error **errp)
+static struct acpi_table_header *acpi_new_table(const unsigned char *blob,
+                                                size_t bloblen,
+                                                bool has_header,
+                                                size_t *rpayload_size,
+                                                Error **errp)
 {
     size_t body_start;
-    const char unsigned *hdr_src;
+    const unsigned char *hdr_src;
     size_t body_size, acpi_payload_size;
     struct acpi_table_header *ext_hdr;
-    unsigned changed_fields;
 
     /* Calculate where the ACPI table body starts within the blob, plus where
      * to copy the ACPI table header from.
@@ -124,7 +107,7 @@ static void acpi_table_install(const char unsigned *blob, size_t bloblen,
             error_setg(errp, "ACPI table claiming to have header is too "
                        "short, available: %zu, expected: %zu", bloblen,
                        body_start);
-            return;
+            return NULL;
         }
         hdr_src = blob;
     } else {
@@ -145,7 +128,7 @@ static void acpi_table_install(const char unsigned *blob, size_t bloblen,
     if (acpi_payload_size > UINT16_MAX) {
         error_setg(errp, "ACPI table too big, requested: %zu, max: %u",
                    acpi_payload_size, (unsigned)UINT16_MAX);
-        return;
+        return NULL;
     }
 
     /* We won't fail from here on. Initialize / extend the globals. */
@@ -173,13 +156,7 @@ static void acpi_table_install(const char unsigned *blob, size_t bloblen,
     stw_le_p(acpi_tables, lduw_le_p(acpi_tables) + 1u);
 
     /* Update the header fields. The strings need not be NUL-terminated. */
-    changed_fields = 0;
     ext_hdr->_length = cpu_to_le16(acpi_payload_size);
-
-    if (hdrs->has_sig) {
-        strncpy(ext_hdr->sig, hdrs->sig, sizeof ext_hdr->sig);
-        ++changed_fields;
-    }
 
     if (has_header && le32_to_cpu(ext_hdr->length) != acpi_payload_size) {
         fprintf(stderr,
@@ -187,14 +164,54 @@ static void acpi_table_install(const char unsigned *blob, size_t bloblen,
                 "%" PRIu32 ", actual size %zu bytes\n",
                 le32_to_cpu(ext_hdr->length), acpi_payload_size);
     }
+
     ext_hdr->length = cpu_to_le32(acpi_payload_size);
+    *rpayload_size = acpi_payload_size;
+
+    return ext_hdr;
+}
+
+/* Install a copy of the ACPI table specified in @blob.
+ *
+ * If @has_header is set, @blob starts with the System Description Table Header
+ * structure. Otherwise, "dfl_hdr" is prepended. In any case, each header field
+ * is optionally overwritten from @hdrs.
+ *
+ * It is valid to call this function with
+ * (@blob == NULL && bloblen == 0 && !has_header).
+ *
+ * @hdrs->file and @hdrs->data are ignored.
+ *
+ * SIZE_MAX is considered "infinity" in this function.
+ *
+ * The number of tables that can be installed is not limited, but the 16-bit
+ * counter at the beginning of "acpi_tables" wraps around after UINT16_MAX.
+ */
+static void acpi_table_install(const char unsigned *blob, size_t bloblen,
+                               bool has_header,
+                               const struct AcpiTableOptions *hdrs,
+                               Error **errp)
+{
+    struct acpi_table_header *ext_hdr;
+    size_t payload_size = 0;
+    unsigned changed_fields = 0;
+
+    ext_hdr = acpi_new_table(blob, bloblen, has_header, &payload_size, errp);
+    if (errp && !*errp) {
+        return;
+    }
+
+    ext_hdr->checksum = 0;
+
+    if (hdrs->has_sig) {
+        strncpy(ext_hdr->sig, hdrs->sig, sizeof ext_hdr->sig);
+        ++changed_fields;
+    }
 
     if (hdrs->has_rev) {
         ext_hdr->revision = hdrs->rev;
         ++changed_fields;
     }
-
-    ext_hdr->checksum = 0;
 
     if (hdrs->has_oem_id) {
         strncpy(ext_hdr->oem_id, hdrs->oem_id, sizeof ext_hdr->oem_id);
@@ -225,7 +242,28 @@ static void acpi_table_install(const char unsigned *blob, size_t bloblen,
 
     /* recalculate checksum */
     ext_hdr->checksum = acpi_checksum((const char unsigned *)ext_hdr +
-                                      ACPI_TABLE_PFX_SIZE, acpi_payload_size);
+                                      ACPI_TABLE_PFX_SIZE, payload_size);
+}
+
+/*
+ * Add a table from an internal driver.
+ */
+void acpi_append_to_table(const char *sig, void *blob, size_t bloblen,
+                          Error **errp)
+{
+    struct acpi_table_header *ext_hdr;
+    size_t payload_size = 0;
+
+    ext_hdr = acpi_new_table(blob, bloblen, false, &payload_size, errp);
+    if (errp && *errp) {
+        return;
+    }
+
+    strncpy(ext_hdr->sig, sig, sizeof ext_hdr->sig);
+
+    /* recalculate checksum */
+    ext_hdr->checksum = acpi_checksum((const char unsigned *)ext_hdr +
+                                      ACPI_TABLE_PFX_SIZE, payload_size);
 }
 
 void acpi_table_add(const QemuOpts *opts, Error **errp)

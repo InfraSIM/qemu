@@ -184,5 +184,7 @@ uint8_t *acpi_table_next(uint8_t *current);
 unsigned acpi_table_len(void *current);
 void acpi_table_add(const QemuOpts *opts, Error **errp);
 void acpi_table_add_builtin(const QemuOpts *opts, Error **errp);
+void acpi_append_to_table(const char *sig, void *blob, size_t bloblen,
+                          Error **errp);
 
 #endif /* !QEMU_HW_ACPI_H */
