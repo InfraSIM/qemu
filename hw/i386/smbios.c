@@ -775,6 +775,7 @@ void smbios_set_defaults(const char *manufacturer, const char *product,
     /* drop unwanted version of command-line file blob(s) */
     if (smbios_legacy) {
         g_free(smbios_tables);
+        smbios_tables = NULL;
         /* in legacy mode, also complain if fields were given for types > 1 */
         if (find_next_bit(have_fields_bitmap,
                           SMBIOS_MAX_TYPE+1, 2) < SMBIOS_MAX_TYPE+1) {
@@ -784,6 +785,7 @@ void smbios_set_defaults(const char *manufacturer, const char *product,
         }
     } else {
         g_free(smbios_entries);
+        smbios_entries = NULL;
     }
 
     SMBIOS_SET_DEFAULT(type1.manufacturer, manufacturer);
@@ -935,7 +937,8 @@ int smbios_table_entry_add(void *data, int size, bool append_zeros)
     header = (struct smbios_structure_header *)(smbios_tables +
                                                 smbios_tables_len);
 
-    memcpy(header, data, size);
+    memset(header, 0, size);
+    memcpy(header, data, append_zeros ? size - 2 : size);
 
     if (test_bit(header->type, have_fields_bitmap)) {
         error_report("can't load type %d struct, fields already specified!",
@@ -987,6 +990,7 @@ void smbios_entry_add(QemuOpts *opts)
 {
     Error *local_err = NULL;
     const char *val;
+    uint8_t *buf = NULL;
 
     assert(!smbios_immutable);
 
@@ -1013,7 +1017,41 @@ void smbios_entry_add(QemuOpts *opts)
             exit(1);
         }
 
-        smbios_table_entry_add(data, size, false);
+        if (memcmp(data + 0x10, "_DMI_", 5) == 0)
+            buf = data + 32;
+        else
+            buf = data;
+
+        /* The following code referenced the dmi_table() in dmidecode source code. */
+        while (buf + 4 < data + size) {
+            uint8_t *next = NULL;
+            struct smbios_structure_header *h;
+
+            h = (struct smbios_structure_header *)buf;
+
+            if (h->length < 4) {
+                error_report("Invalid entry length (%u)\n", h->length);
+                break;
+            }
+
+            if (h->type == 127)
+                break;
+
+            /* look for the next handle */
+            next = buf + h->length;
+            while (next - buf + 1 < size && (next[0] != 0 || next[1] != 0))
+                next++;
+            next += 2;
+
+            /* Since the IPMI interface will re-add type 38 table in ipmi_encode_smbios(),
+             * so here ignore type 38 if exists.
+             */
+            if (h->type != 38)
+                smbios_table_entry_add(buf, next - buf, false);
+
+            buf = next;
+        }
+
         g_free(data);
         return;
     }
