@@ -22,15 +22,16 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
-#include <sys/stat.h>
+#include "qemu/osdep.h"
 #include <dirent.h>
-#include "qemu-common.h"
+#include "qapi/error.h"
 #include "block/block_int.h"
 #include "qemu/module.h"
 #include "migration/migration.h"
 #include "qapi/qmp/qint.h"
 #include "qapi/qmp/qbool.h"
 #include "qapi/qmp/qstring.h"
+#include "qemu/cutils.h"
 
 #ifndef S_IWGRP
 #define S_IWGRP 0
@@ -984,12 +985,6 @@ static BDRVVVFATState *vvv = NULL;
 
 static int enable_write_target(BDRVVVFATState *s, Error **errp);
 static int is_consistent(BDRVVVFATState *s);
-
-static void vvfat_rebind(BlockDriverState *bs)
-{
-    BDRVVVFATState *s = bs->opaque;
-    s->bs = bs;
-}
 
 static QemuOptsList runtime_opts = {
     .name = "vvfat",
@@ -2890,7 +2885,7 @@ static coroutine_fn int vvfat_co_write(BlockDriverState *bs, int64_t sector_num,
 }
 
 static int64_t coroutine_fn vvfat_co_get_block_status(BlockDriverState *bs,
-	int64_t sector_num, int nb_sectors, int* n)
+	int64_t sector_num, int nb_sectors, int *n, BlockDriverState **file)
 {
     BDRVVVFATState* s = bs->opaque;
     *n = s->sector_count - sector_num;
@@ -2923,9 +2918,12 @@ static BlockDriver vvfat_write_target = {
 static int enable_write_target(BDRVVVFATState *s, Error **errp)
 {
     BlockDriver *bdrv_qcow = NULL;
+    BlockDriverState *backing;
     QemuOpts *opts = NULL;
     int ret;
     int size = sector2cluster(s, s->sector_count);
+    QDict *options;
+
     s->used_clusters = calloc(size, 1);
 
     array_init(&(s->commits), sizeof(commit_t));
@@ -2956,9 +2954,10 @@ static int enable_write_target(BDRVVVFATState *s, Error **errp)
     }
 
     s->qcow = NULL;
-    ret = bdrv_open(&s->qcow, s->qcow_filename, NULL, NULL,
-                    BDRV_O_RDWR | BDRV_O_CACHE_WB | BDRV_O_NO_FLUSH,
-                    bdrv_qcow, errp);
+    options = qdict_new();
+    qdict_put(options, "driver", qstring_from_str("qcow"));
+    ret = bdrv_open(&s->qcow, s->qcow_filename, NULL, options,
+                    BDRV_O_RDWR | BDRV_O_NO_FLUSH, errp);
     if (ret < 0) {
         goto err;
     }
@@ -2967,10 +2966,13 @@ static int enable_write_target(BDRVVVFATState *s, Error **errp)
     unlink(s->qcow_filename);
 #endif
 
-    bdrv_set_backing_hd(s->bs, bdrv_new());
-    s->bs->backing_hd->drv = &vvfat_write_target;
-    s->bs->backing_hd->opaque = g_new(void *, 1);
-    *(void**)s->bs->backing_hd->opaque = s;
+    backing = bdrv_new();
+    bdrv_set_backing_hd(s->bs, backing);
+    bdrv_unref(backing);
+
+    s->bs->backing->bs->drv = &vvfat_write_target;
+    s->bs->backing->bs->opaque = g_new(void *, 1);
+    *(void**)s->bs->backing->bs->opaque = s;
 
     return 0;
 
@@ -3004,7 +3006,6 @@ static BlockDriver bdrv_vvfat = {
     .bdrv_parse_filename    = vvfat_parse_filename,
     .bdrv_file_open         = vvfat_open,
     .bdrv_close             = vvfat_close,
-    .bdrv_rebind            = vvfat_rebind,
 
     .bdrv_read              = vvfat_co_read,
     .bdrv_write             = vvfat_co_write,

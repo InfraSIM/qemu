@@ -21,6 +21,8 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
+#include "qemu/osdep.h"
+#include "qapi/error.h"
 #include "hw/hw.h"
 #include "vga.h"
 #include "ui/console.h"
@@ -234,9 +236,9 @@ static void vga_precise_update_retrace_info(VGACommonState *s)
 
     r->total_chars = vtotal_lines * htotal_chars;
     if (r->freq) {
-        r->ticks_per_char = get_ticks_per_sec() / (r->total_chars * r->freq);
+        r->ticks_per_char = NANOSECONDS_PER_SECOND / (r->total_chars * r->freq);
     } else {
-        r->ticks_per_char = get_ticks_per_sec() / chars_per_sec;
+        r->ticks_per_char = NANOSECONDS_PER_SECOND / chars_per_sec;
     }
 
     r->vstart = vretr_start_line;
@@ -264,7 +266,7 @@ static void vga_precise_update_retrace_info(VGACommonState *s)
         "dots = %d\n"
         "ticks/char = %" PRId64 "\n"
         "\n",
-        (double) get_ticks_per_sec() / (r->ticks_per_char * r->total_chars),
+        (double) NANOSECONDS_PER_SECOND / (r->ticks_per_char * r->total_chars),
         htotal_chars,
         hretr_start_char,
         hretr_skew_chars,
@@ -1979,7 +1981,8 @@ static void vga_update_text(void *opaque, console_ch_t *chardata)
     width = (s->last_width - size) / 2;
     dst = chardata + s->last_width + width;
     for (i = 0; i < size; i ++)
-        console_write_ch(dst ++, 0x00200100 | msg_buffer[i]);
+        console_write_ch(dst ++, ATTR2CHTYPE(msg_buffer[i], QEMU_COLOR_BLUE,
+                                             QEMU_COLOR_BLACK, 1));
 
     dpy_text_update(s->con, 0, 0, s->last_width, height);
 }
@@ -2139,7 +2142,7 @@ void vga_common_init(VGACommonState *s, Object *obj, bool global_vmstate)
 
     s->is_vbe_vmstate = 1;
     memory_region_init_ram(&s->vram, obj, "vga.vram", s->vram_size,
-                           &error_abort);
+                           &error_fatal);
     vmstate_register_ram(&s->vram, global_vmstate ? NULL : DEVICE(obj));
     xen_register_framebuffer(&s->vram);
     s->vram_ptr = memory_region_get_ram_ptr(&s->vram);
