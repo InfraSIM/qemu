@@ -989,10 +989,10 @@ void smbios_entry_add(QemuOpts *opts)
                 next++;
             next += 2;
 
-
-            if (header->type == 38)
+            if (header->type == 38) {
                 buf = next;
                 continue;
+            }
 
             e_size = next - buf;
             /*
@@ -1047,7 +1047,6 @@ void smbios_entry_add(QemuOpts *opts)
             /* end: add a copy of the newly loaded blob to legacy smbios_entries */
             
             buf = next;
-
         }
         g_free(data);
         return;
