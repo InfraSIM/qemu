@@ -24,7 +24,6 @@
 
 #include "qemu/osdep.h"
 
-#include <glib.h>
 
 #include "libqtest.h"
 #include "libqos/libqos.h"
@@ -32,6 +31,7 @@
 #include "libqos/malloc-pc.h"
 
 #include "qemu-common.h"
+#include "qemu/bswap.h"
 #include "hw/pci/pci_ids.h"
 #include "hw/pci/pci_regs.h"
 

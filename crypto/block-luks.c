@@ -20,6 +20,7 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qemu/bswap.h"
 
 #include "crypto/block-luks.h"
 
@@ -1080,8 +1081,7 @@ qcrypto_block_luks_create(QCryptoBlock *block,
         luks->header.key_slots[i].key_offset =
             (QCRYPTO_BLOCK_LUKS_KEY_SLOT_OFFSET /
              QCRYPTO_BLOCK_LUKS_SECTOR_SIZE) +
-            (ROUND_UP(((splitkeylen + (QCRYPTO_BLOCK_LUKS_SECTOR_SIZE - 1)) /
-                       QCRYPTO_BLOCK_LUKS_SECTOR_SIZE),
+            (ROUND_UP(DIV_ROUND_UP(splitkeylen, QCRYPTO_BLOCK_LUKS_SECTOR_SIZE),
                       (QCRYPTO_BLOCK_LUKS_KEY_SLOT_OFFSET /
                        QCRYPTO_BLOCK_LUKS_SECTOR_SIZE)) * i);
     }
@@ -1181,8 +1181,7 @@ qcrypto_block_luks_create(QCryptoBlock *block,
     luks->header.payload_offset =
         (QCRYPTO_BLOCK_LUKS_KEY_SLOT_OFFSET /
          QCRYPTO_BLOCK_LUKS_SECTOR_SIZE) +
-        (ROUND_UP(((splitkeylen + (QCRYPTO_BLOCK_LUKS_SECTOR_SIZE - 1)) /
-                   QCRYPTO_BLOCK_LUKS_SECTOR_SIZE),
+        (ROUND_UP(DIV_ROUND_UP(splitkeylen, QCRYPTO_BLOCK_LUKS_SECTOR_SIZE),
                   (QCRYPTO_BLOCK_LUKS_KEY_SLOT_OFFSET /
                    QCRYPTO_BLOCK_LUKS_SECTOR_SIZE)) *
          QCRYPTO_BLOCK_LUKS_NUM_KEY_SLOTS);

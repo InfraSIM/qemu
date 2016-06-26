@@ -367,7 +367,9 @@ struct AcpiMadtGenericDistributor {
     uint32_t gic_id;
     uint64_t base_address;
     uint32_t global_irq_base;
-    uint32_t reserved2;
+    /* ACPI 5.1 Errata 1228 Present GIC version in MADT table */
+    uint8_t version;
+    uint8_t reserved2[3];
 } QEMU_PACKED;
 
 typedef struct AcpiMadtGenericDistributor AcpiMadtGenericDistributor;
@@ -455,8 +457,10 @@ struct AcpiSystemResourceAffinityTable
 } QEMU_PACKED;
 typedef struct AcpiSystemResourceAffinityTable AcpiSystemResourceAffinityTable;
 
-#define ACPI_SRAT_PROCESSOR          0
+#define ACPI_SRAT_PROCESSOR_APIC     0
 #define ACPI_SRAT_MEMORY             1
+#define ACPI_SRAT_PROCESSOR_x2APIC   2
+#define ACPI_SRAT_PROCESSOR_GICC     3
 
 struct AcpiSratProcessorAffinity
 {
@@ -473,7 +477,7 @@ typedef struct AcpiSratProcessorAffinity AcpiSratProcessorAffinity;
 struct AcpiSratMemoryAffinity
 {
     ACPI_SUB_HEADER_DEF
-    uint8_t     proximity[4];
+    uint32_t    proximity;
     uint16_t    reserved1;
     uint64_t    base_addr;
     uint64_t    range_length;
@@ -482,6 +486,17 @@ struct AcpiSratMemoryAffinity
     uint32_t    reserved3[2];
 } QEMU_PACKED;
 typedef struct AcpiSratMemoryAffinity AcpiSratMemoryAffinity;
+
+struct AcpiSratProcessorGiccAffinity
+{
+    ACPI_SUB_HEADER_DEF
+    uint32_t    proximity;
+    uint32_t    acpi_processor_uid;
+    uint32_t    flags;
+    uint32_t    clock_domain;
+} QEMU_PACKED;
+
+typedef struct AcpiSratProcessorGiccAffinity AcpiSratProcessorGiccAffinity;
 
 /* PCI fw r3.0 MCFG table. */
 /* Subtable */

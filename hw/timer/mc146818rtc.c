@@ -22,7 +22,6 @@
  * THE SOFTWARE.
  */
 #include "qemu/osdep.h"
-#include "config-target.h"
 #include "qemu/cutils.h"
 #include "qemu/bcd.h"
 #include "hw/hw.h"
@@ -106,12 +105,10 @@ static inline bool rtc_running(RTCState *s)
 
 static uint64_t get_guest_rtc_ns(RTCState *s)
 {
-    uint64_t guest_rtc;
     uint64_t guest_clock = qemu_clock_get_ns(rtc_clock);
 
-    guest_rtc = s->base_rtc * NANOSECONDS_PER_SECOND +
+    return s->base_rtc * NANOSECONDS_PER_SECOND +
         guest_clock - s->last_update + s->offset;
-    return guest_rtc;
 }
 
 #ifdef TARGET_I386

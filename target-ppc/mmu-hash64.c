@@ -20,6 +20,7 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "cpu.h"
+#include "exec/exec-all.h"
 #include "exec/helper-proto.h"
 #include "qemu/error-report.h"
 #include "sysemu/kvm.h"
@@ -98,10 +99,8 @@ void dump_slb(FILE *f, fprintf_function cpu_fprintf, PowerPCCPU *cpu)
 
 void helper_slbia(CPUPPCState *env)
 {
-    PowerPCCPU *cpu = ppc_env_get_cpu(env);
-    int n, do_invalidate;
+    int n;
 
-    do_invalidate = 0;
     /* XXX: Warning: slbia never invalidates the first segment */
     for (n = 1; n < env->slb_nr; n++) {
         ppc_slb_t *slb = &env->slb[n];
@@ -112,11 +111,8 @@ void helper_slbia(CPUPPCState *env)
              *      and we still don't have a tlb_flush_mask(env, n, mask)
              *      in QEMU, we just invalidate all TLBs
              */
-            do_invalidate = 1;
+            env->tlb_need_flush = 1;
         }
-    }
-    if (do_invalidate) {
-        tlb_flush(CPU(cpu), 1);
     }
 }
 
@@ -137,7 +133,7 @@ void helper_slbie(CPUPPCState *env, target_ulong addr)
          *      and we still don't have a tlb_flush_mask(env, n, mask)
          *      in QEMU, we just invalidate all TLBs
          */
-        tlb_flush(CPU(cpu), 1);
+        env->tlb_need_flush = 1;
     }
 }
 
@@ -223,6 +219,24 @@ static int ppc_load_slb_vsid(PowerPCCPU *cpu, target_ulong rb,
     return 0;
 }
 
+static int ppc_find_slb_vsid(PowerPCCPU *cpu, target_ulong rb,
+                             target_ulong *rt)
+{
+    CPUPPCState *env = &cpu->env;
+    ppc_slb_t *slb;
+
+    if (!msr_is_64bit(env, env->msr)) {
+        rb &= 0xffffffff;
+    }
+    slb = slb_lookup(cpu, rb);
+    if (slb == NULL) {
+        *rt = (target_ulong)-1ul;
+    } else {
+        *rt = slb->vsid;
+    }
+    return 0;
+}
+
 void helper_store_slb(CPUPPCState *env, target_ulong rb, target_ulong rs)
 {
     PowerPCCPU *cpu = ppc_env_get_cpu(env);
@@ -239,6 +253,18 @@ target_ulong helper_load_slb_esid(CPUPPCState *env, target_ulong rb)
     target_ulong rt = 0;
 
     if (ppc_load_slb_esid(cpu, rb, &rt) < 0) {
+        helper_raise_exception_err(env, POWERPC_EXCP_PROGRAM,
+                                   POWERPC_EXCP_INVAL);
+    }
+    return rt;
+}
+
+target_ulong helper_find_slb_vsid(CPUPPCState *env, target_ulong rb)
+{
+    PowerPCCPU *cpu = ppc_env_get_cpu(env);
+    target_ulong rt = 0;
+
+    if (ppc_find_slb_vsid(cpu, rb, &rt) < 0) {
         helper_raise_exception_err(env, POWERPC_EXCP_PROGRAM,
                                    POWERPC_EXCP_INVAL);
     }
@@ -282,8 +308,6 @@ void ppc_hash64_set_external_hpt(PowerPCCPU *cpu, void *hpt, int shift,
 {
     CPUPPCState *env = &cpu->env;
     Error *local_err = NULL;
-
-    cpu_synchronize_state(CPU(cpu));
 
     if (hpt) {
         env->external_htab = hpt;
@@ -589,7 +613,48 @@ unsigned ppc_hash64_hpte_page_shift_noslb(PowerPCCPU *cpu,
     return 0;
 }
 
-int ppc_hash64_handle_mmu_fault(PowerPCCPU *cpu, target_ulong eaddr,
+static void ppc_hash64_set_isi(CPUState *cs, CPUPPCState *env,
+                               uint64_t error_code)
+{
+    bool vpm;
+
+    if (msr_ir) {
+        vpm = !!(env->spr[SPR_LPCR] & LPCR_VPM1);
+    } else {
+        vpm = !!(env->spr[SPR_LPCR] & LPCR_VPM0);
+    }
+    if (vpm && !msr_hv) {
+        cs->exception_index = POWERPC_EXCP_HISI;
+    } else {
+        cs->exception_index = POWERPC_EXCP_ISI;
+    }
+    env->error_code = error_code;
+}
+
+static void ppc_hash64_set_dsi(CPUState *cs, CPUPPCState *env, uint64_t dar,
+                               uint64_t dsisr)
+{
+    bool vpm;
+
+    if (msr_dr) {
+        vpm = !!(env->spr[SPR_LPCR] & LPCR_VPM1);
+    } else {
+        vpm = !!(env->spr[SPR_LPCR] & LPCR_VPM0);
+    }
+    if (vpm && !msr_hv) {
+        cs->exception_index = POWERPC_EXCP_HDSI;
+        env->spr[SPR_HDAR] = dar;
+        env->spr[SPR_HDSISR] = dsisr;
+    } else {
+        cs->exception_index = POWERPC_EXCP_DSI;
+        env->spr[SPR_DAR] = dar;
+        env->spr[SPR_DSISR] = dsisr;
+   }
+    env->error_code = 0;
+}
+
+
+int ppc_hash64_handle_mmu_fault(PowerPCCPU *cpu, vaddr eaddr,
                                 int rwx, int mmu_idx)
 {
     CPUState *cs = CPU(cpu);
@@ -599,7 +664,7 @@ int ppc_hash64_handle_mmu_fault(PowerPCCPU *cpu, target_ulong eaddr,
     hwaddr pte_offset;
     ppc_hash_pte64_t pte;
     int pp_prot, amr_prot, prot;
-    uint64_t new_pte1;
+    uint64_t new_pte1, dsisr;
     const int need_prot[] = {PAGE_READ, PAGE_WRITE, PAGE_EXEC};
     hwaddr raddr;
 
@@ -633,26 +698,21 @@ int ppc_hash64_handle_mmu_fault(PowerPCCPU *cpu, target_ulong eaddr,
 
     /* 3. Check for segment level no-execute violation */
     if ((rwx == 2) && (slb->vsid & SLB_VSID_N)) {
-        cs->exception_index = POWERPC_EXCP_ISI;
-        env->error_code = 0x10000000;
+        ppc_hash64_set_isi(cs, env, 0x10000000);
         return 1;
     }
 
     /* 4. Locate the PTE in the hash table */
     pte_offset = ppc_hash64_htab_lookup(cpu, slb, eaddr, &pte);
     if (pte_offset == -1) {
+        dsisr = 0x40000000;
         if (rwx == 2) {
-            cs->exception_index = POWERPC_EXCP_ISI;
-            env->error_code = 0x40000000;
+            ppc_hash64_set_isi(cs, env, dsisr);
         } else {
-            cs->exception_index = POWERPC_EXCP_DSI;
-            env->error_code = 0;
-            env->spr[SPR_DAR] = eaddr;
             if (rwx == 1) {
-                env->spr[SPR_DSISR] = 0x42000000;
-            } else {
-                env->spr[SPR_DSISR] = 0x40000000;
+                dsisr |= 0x02000000;
             }
+            ppc_hash64_set_dsi(cs, env, eaddr, dsisr);
         }
         return 1;
     }
@@ -681,14 +741,9 @@ int ppc_hash64_handle_mmu_fault(PowerPCCPU *cpu, target_ulong eaddr,
         /* Access right violation */
         qemu_log_mask(CPU_LOG_MMU, "PTE access rejected\n");
         if (rwx == 2) {
-            cs->exception_index = POWERPC_EXCP_ISI;
-            env->error_code = 0x08000000;
+            ppc_hash64_set_isi(cs, env, 0x08000000);
         } else {
-            target_ulong dsisr = 0;
-
-            cs->exception_index = POWERPC_EXCP_DSI;
-            env->error_code = 0;
-            env->spr[SPR_DAR] = eaddr;
+            dsisr = 0;
             if (need_prot[rwx] & ~pp_prot) {
                 dsisr |= 0x08000000;
             }
@@ -698,7 +753,7 @@ int ppc_hash64_handle_mmu_fault(PowerPCCPU *cpu, target_ulong eaddr,
             if (need_prot[rwx] & ~amr_prot) {
                 dsisr |= 0x00200000;
             }
-            env->spr[SPR_DSISR] = dsisr;
+            ppc_hash64_set_dsi(cs, env, eaddr, dsisr);
         }
         return 1;
     }

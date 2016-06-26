@@ -21,6 +21,7 @@
 #include "cpu.h"
 #include "disas/disas.h"
 #include "qemu/host-utils.h"
+#include "exec/exec-all.h"
 #include "tcg-op.h"
 #include "exec/cpu_ldst.h"
 
@@ -150,6 +151,7 @@ void alpha_translate_init(void)
     done_init = 1;
 
     cpu_env = tcg_global_reg_new_ptr(TCG_AREG0, "env");
+    tcg_ctx.tcg_env = cpu_env;
 
     for (i = 0; i < 31; i++) {
         cpu_std_ir[i] = tcg_global_mem_new_i64(cpu_env,
@@ -460,12 +462,16 @@ static bool use_goto_tb(DisasContext *ctx, uint64_t dest)
         || ctx->singlestep_enabled || singlestep) {
         return false;
     }
+#ifndef CONFIG_USER_ONLY
     /* If the destination is in the superpage, the page perms can't change.  */
     if (in_superpage(ctx, dest)) {
         return true;
     }
     /* Check for the dest on the same page as the start of the TB.  */
     return ((ctx->tb->pc ^ dest) & TARGET_PAGE_MASK) == 0;
+#else
+    return true;
+#endif
 }
 
 static ExitStatus gen_bdirect(DisasContext *ctx, int ra, int32_t disp)
@@ -2989,7 +2995,8 @@ void gen_intermediate_code(CPUAlphaState *env, struct TranslationBlock *tb)
     tb->icount = num_insns;
 
 #ifdef DEBUG_DISAS
-    if (qemu_loglevel_mask(CPU_LOG_TB_IN_ASM)) {
+    if (qemu_loglevel_mask(CPU_LOG_TB_IN_ASM)
+        && qemu_log_in_addr_range(pc_start)) {
         qemu_log("IN: %s\n", lookup_symbol(pc_start));
         log_target_disas(cs, pc_start, ctx.pc - pc_start, 1);
         qemu_log("\n");

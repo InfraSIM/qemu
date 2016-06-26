@@ -5,7 +5,6 @@
 #include <sys/shm.h>
 #include <sys/select.h>
 #include <sys/mount.h>
-#include <sys/mman.h>
 #include <sched.h>
 #include "qemu.h"
 
@@ -281,7 +280,7 @@ print_ipc(const struct syscallname *name,
 static void
 print_syscall_ret_addr(const struct syscallname *name, abi_long ret)
 {
-    char *errstr = NULL;
+    const char *errstr = NULL;
 
     if (ret < 0) {
         errstr = target_strerror(-ret);
@@ -1594,7 +1593,7 @@ void
 print_syscall_ret(int num, abi_long ret)
 {
     int i;
-    char *errstr = NULL;
+    const char *errstr = NULL;
 
     for(i=0;i<nsyscalls;i++)
         if( scnames[i].nr == num ) {

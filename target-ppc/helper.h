@@ -13,9 +13,11 @@ DEF_HELPER_1(rfci, void, env)
 DEF_HELPER_1(rfdi, void, env)
 DEF_HELPER_1(rfmci, void, env)
 #if defined(TARGET_PPC64)
+DEF_HELPER_2(pminsn, void, env, i32)
 DEF_HELPER_1(rfid, void, env)
 DEF_HELPER_1(hrfid, void, env)
 #endif
+DEF_HELPER_1(check_tlb_flush, void, env)
 #endif
 
 DEF_HELPER_3(lmw, void, env, tl, i32)
@@ -549,6 +551,7 @@ DEF_HELPER_FLAGS_2(tlbiva, TCG_CALL_NO_RWG, void, env, tl)
 DEF_HELPER_FLAGS_3(store_slb, TCG_CALL_NO_RWG, void, env, tl, tl)
 DEF_HELPER_2(load_slb_esid, tl, env, tl)
 DEF_HELPER_2(load_slb_vsid, tl, env, tl)
+DEF_HELPER_2(find_slb_vsid, tl, env, tl)
 DEF_HELPER_FLAGS_1(slbia, TCG_CALL_NO_RWG, void, env)
 DEF_HELPER_FLAGS_2(slbie, TCG_CALL_NO_RWG, void, env, tl)
 #endif
@@ -668,3 +671,4 @@ DEF_HELPER_4(dscli, void, env, fprp, fprp, i32)
 DEF_HELPER_4(dscliq, void, env, fprp, fprp, i32)
 
 DEF_HELPER_1(tbegin, void, env)
+DEF_HELPER_1(fixup_thrm, void, env)

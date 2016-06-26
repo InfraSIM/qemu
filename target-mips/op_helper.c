@@ -20,6 +20,7 @@
 #include "cpu.h"
 #include "qemu/host-utils.h"
 #include "exec/helper-proto.h"
+#include "exec/exec-all.h"
 #include "exec/cpu_ldst.h"
 #include "sysemu/kvm.h"
 
@@ -132,10 +133,8 @@ static inline uint64_t get_HILO(CPUMIPSState *env)
 
 static inline target_ulong set_HIT0_LO(CPUMIPSState *env, uint64_t HILO)
 {
-    target_ulong tmp;
     env->active_tc.LO[0] = (int32_t)(HILO & 0xFFFFFFFF);
-    tmp = env->active_tc.HI[0] = (int32_t)(HILO >> 32);
-    return tmp;
+    return env->active_tc.HI[0] = (int32_t)(HILO >> 32);
 }
 
 static inline target_ulong set_HI_LOT0(CPUMIPSState *env, uint64_t HILO)
@@ -581,7 +580,7 @@ static bool mips_vp_is_wfi(MIPSCPU *c)
 
 static inline void mips_vpe_wake(MIPSCPU *c)
 {
-    /* Dont set ->halted = 0 directly, let it be done via cpu_has_work
+    /* Don't set ->halted = 0 directly, let it be done via cpu_has_work
        because there might be other conditions that state that c should
        be sleeping.  */
     cpu_interrupt(CPU(c), CPU_INTERRUPT_WAKE);
@@ -2294,29 +2293,29 @@ void helper_deret(CPUMIPSState *env)
 }
 #endif /* !CONFIG_USER_ONLY */
 
-static inline void check_hwrena(CPUMIPSState *env, int reg)
+static inline void check_hwrena(CPUMIPSState *env, int reg, uintptr_t pc)
 {
     if ((env->hflags & MIPS_HFLAG_CP0) || (env->CP0_HWREna & (1 << reg))) {
         return;
     }
-    do_raise_exception(env, EXCP_RI, GETPC());
+    do_raise_exception(env, EXCP_RI, pc);
 }
 
 target_ulong helper_rdhwr_cpunum(CPUMIPSState *env)
 {
-    check_hwrena(env, 0);
+    check_hwrena(env, 0, GETPC());
     return env->CP0_EBase & 0x3ff;
 }
 
 target_ulong helper_rdhwr_synci_step(CPUMIPSState *env)
 {
-    check_hwrena(env, 1);
+    check_hwrena(env, 1, GETPC());
     return env->SYNCI_Step;
 }
 
 target_ulong helper_rdhwr_cc(CPUMIPSState *env)
 {
-    check_hwrena(env, 2);
+    check_hwrena(env, 2, GETPC());
 #ifdef CONFIG_USER_ONLY
     return env->CP0_Count;
 #else
@@ -2326,19 +2325,19 @@ target_ulong helper_rdhwr_cc(CPUMIPSState *env)
 
 target_ulong helper_rdhwr_ccres(CPUMIPSState *env)
 {
-    check_hwrena(env, 3);
+    check_hwrena(env, 3, GETPC());
     return env->CCRes;
 }
 
 target_ulong helper_rdhwr_performance(CPUMIPSState *env)
 {
-    check_hwrena(env, 4);
+    check_hwrena(env, 4, GETPC());
     return env->CP0_Performance0;
 }
 
 target_ulong helper_rdhwr_xnp(CPUMIPSState *env)
 {
-    check_hwrena(env, 5);
+    check_hwrena(env, 5, GETPC());
     return (env->CP0_Config5 >> CP0C5_XNP) & 1;
 }
 

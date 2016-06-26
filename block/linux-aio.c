@@ -11,8 +11,10 @@
 #include "qemu-common.h"
 #include "block/aio.h"
 #include "qemu/queue.h"
+#include "block/block.h"
 #include "block/raw-aio.h"
 #include "qemu/event_notifier.h"
+#include "qemu/coroutine.h"
 
 #include <libaio.h>
 
@@ -30,7 +32,8 @@
 
 struct qemu_laiocb {
     BlockAIOCB common;
-    struct qemu_laio_state *ctx;
+    Coroutine *co;
+    LinuxAioState *ctx;
     struct iocb iocb;
     ssize_t ret;
     size_t nbytes;
@@ -46,7 +49,7 @@ typedef struct {
     QSIMPLEQ_HEAD(, qemu_laiocb) pending;
 } LaioQueue;
 
-struct qemu_laio_state {
+struct LinuxAioState {
     io_context_t ctx;
     EventNotifier e;
 
@@ -60,7 +63,7 @@ struct qemu_laio_state {
     int event_max;
 };
 
-static void ioq_submit(struct qemu_laio_state *s);
+static void ioq_submit(LinuxAioState *s);
 
 static inline ssize_t io_event_ret(struct io_event *ev)
 {
@@ -70,8 +73,7 @@ static inline ssize_t io_event_ret(struct io_event *ev)
 /*
  * Completes an AIO request (calls the callback and frees the ACB).
  */
-static void qemu_laio_process_completion(struct qemu_laio_state *s,
-    struct qemu_laiocb *laiocb)
+static void qemu_laio_process_completion(struct qemu_laiocb *laiocb)
 {
     int ret;
 
@@ -89,9 +91,14 @@ static void qemu_laio_process_completion(struct qemu_laio_state *s,
             }
         }
     }
-    laiocb->common.cb(laiocb->common.opaque, ret);
 
-    qemu_aio_unref(laiocb);
+    laiocb->ret = ret;
+    if (laiocb->co) {
+        qemu_coroutine_enter(laiocb->co, NULL);
+    } else {
+        laiocb->common.cb(laiocb->common.opaque, ret);
+        qemu_aio_unref(laiocb);
+    }
 }
 
 /* The completion BH fetches completed I/O requests and invokes their
@@ -99,7 +106,7 @@ static void qemu_laio_process_completion(struct qemu_laio_state *s,
  *
  * The function is somewhat tricky because it supports nested event loops, for
  * example when a request callback invokes aio_poll().  In order to do this,
- * the completion events array and index are kept in qemu_laio_state.  The BH
+ * the completion events array and index are kept in LinuxAioState.  The BH
  * reschedules itself as long as there are completions pending so it will
  * either be called again in a nested event loop or will be called after all
  * events have been completed.  When there are no events left to complete, the
@@ -107,7 +114,7 @@ static void qemu_laio_process_completion(struct qemu_laio_state *s,
  */
 static void qemu_laio_completion_bh(void *opaque)
 {
-    struct qemu_laio_state *s = opaque;
+    LinuxAioState *s = opaque;
 
     /* Fetch more completion events when empty */
     if (s->event_idx == s->event_max) {
@@ -136,20 +143,22 @@ static void qemu_laio_completion_bh(void *opaque)
         laiocb->ret = io_event_ret(&s->events[s->event_idx]);
         s->event_idx++;
 
-        qemu_laio_process_completion(s, laiocb);
+        qemu_laio_process_completion(laiocb);
     }
 
     if (!s->io_q.plugged && !QSIMPLEQ_EMPTY(&s->io_q.pending)) {
         ioq_submit(s);
     }
+
+    qemu_bh_cancel(s->completion_bh);
 }
 
 static void qemu_laio_completion_cb(EventNotifier *e)
 {
-    struct qemu_laio_state *s = container_of(e, struct qemu_laio_state, e);
+    LinuxAioState *s = container_of(e, LinuxAioState, e);
 
     if (event_notifier_test_and_clear(&s->e)) {
-        qemu_bh_schedule(s->completion_bh);
+        qemu_laio_completion_bh(s);
     }
 }
 
@@ -185,7 +194,7 @@ static void ioq_init(LaioQueue *io_q)
     io_q->blocked = false;
 }
 
-static void ioq_submit(struct qemu_laio_state *s)
+static void ioq_submit(LinuxAioState *s)
 {
     int ret, len;
     struct qemu_laiocb *aiocb;
@@ -216,45 +225,27 @@ static void ioq_submit(struct qemu_laio_state *s)
     s->io_q.blocked = (s->io_q.n > 0);
 }
 
-void laio_io_plug(BlockDriverState *bs, void *aio_ctx)
+void laio_io_plug(BlockDriverState *bs, LinuxAioState *s)
 {
-    struct qemu_laio_state *s = aio_ctx;
-
-    s->io_q.plugged++;
+    assert(!s->io_q.plugged);
+    s->io_q.plugged = 1;
 }
 
-void laio_io_unplug(BlockDriverState *bs, void *aio_ctx, bool unplug)
+void laio_io_unplug(BlockDriverState *bs, LinuxAioState *s)
 {
-    struct qemu_laio_state *s = aio_ctx;
-
-    assert(s->io_q.plugged > 0 || !unplug);
-
-    if (unplug && --s->io_q.plugged > 0) {
-        return;
-    }
-
+    assert(s->io_q.plugged);
+    s->io_q.plugged = 0;
     if (!s->io_q.blocked && !QSIMPLEQ_EMPTY(&s->io_q.pending)) {
         ioq_submit(s);
     }
 }
 
-BlockAIOCB *laio_submit(BlockDriverState *bs, void *aio_ctx, int fd,
-        int64_t sector_num, QEMUIOVector *qiov, int nb_sectors,
-        BlockCompletionFunc *cb, void *opaque, int type)
+static int laio_do_submit(int fd, struct qemu_laiocb *laiocb, off_t offset,
+                          int type)
 {
-    struct qemu_laio_state *s = aio_ctx;
-    struct qemu_laiocb *laiocb;
-    struct iocb *iocbs;
-    off_t offset = sector_num * 512;
-
-    laiocb = qemu_aio_get(&laio_aiocb_info, bs, cb, opaque);
-    laiocb->nbytes = nb_sectors * 512;
-    laiocb->ctx = s;
-    laiocb->ret = -EINPROGRESS;
-    laiocb->is_read = (type == QEMU_AIO_READ);
-    laiocb->qiov = qiov;
-
-    iocbs = &laiocb->iocb;
+    LinuxAioState *s = laiocb->ctx;
+    struct iocb *iocbs = &laiocb->iocb;
+    QEMUIOVector *qiov = laiocb->qiov;
 
     switch (type) {
     case QEMU_AIO_WRITE:
@@ -267,7 +258,7 @@ BlockAIOCB *laio_submit(BlockDriverState *bs, void *aio_ctx, int fd,
     default:
         fprintf(stderr, "%s: invalid AIO request type 0x%x.\n",
                         __func__, type);
-        goto out_free_aiocb;
+        return -EIO;
     }
     io_set_eventfd(&laiocb->iocb, event_notifier_get_fd(&s->e));
 
@@ -277,33 +268,71 @@ BlockAIOCB *laio_submit(BlockDriverState *bs, void *aio_ctx, int fd,
         (!s->io_q.plugged || s->io_q.n >= MAX_QUEUED_IO)) {
         ioq_submit(s);
     }
-    return &laiocb->common;
 
-out_free_aiocb:
-    qemu_aio_unref(laiocb);
-    return NULL;
+    return 0;
 }
 
-void laio_detach_aio_context(void *s_, AioContext *old_context)
+int coroutine_fn laio_co_submit(BlockDriverState *bs, LinuxAioState *s, int fd,
+                                uint64_t offset, QEMUIOVector *qiov, int type)
 {
-    struct qemu_laio_state *s = s_;
+    int ret;
+    struct qemu_laiocb laiocb = {
+        .co         = qemu_coroutine_self(),
+        .nbytes     = qiov->size,
+        .ctx        = s,
+        .is_read    = (type == QEMU_AIO_READ),
+        .qiov       = qiov,
+    };
 
+    ret = laio_do_submit(fd, &laiocb, offset, type);
+    if (ret < 0) {
+        return ret;
+    }
+
+    qemu_coroutine_yield();
+    return laiocb.ret;
+}
+
+BlockAIOCB *laio_submit(BlockDriverState *bs, LinuxAioState *s, int fd,
+        int64_t sector_num, QEMUIOVector *qiov, int nb_sectors,
+        BlockCompletionFunc *cb, void *opaque, int type)
+{
+    struct qemu_laiocb *laiocb;
+    off_t offset = sector_num * BDRV_SECTOR_SIZE;
+    int ret;
+
+    laiocb = qemu_aio_get(&laio_aiocb_info, bs, cb, opaque);
+    laiocb->nbytes = nb_sectors * BDRV_SECTOR_SIZE;
+    laiocb->ctx = s;
+    laiocb->ret = -EINPROGRESS;
+    laiocb->is_read = (type == QEMU_AIO_READ);
+    laiocb->qiov = qiov;
+
+    ret = laio_do_submit(fd, laiocb, offset, type);
+    if (ret < 0) {
+        qemu_aio_unref(laiocb);
+        return NULL;
+    }
+
+    return &laiocb->common;
+}
+
+void laio_detach_aio_context(LinuxAioState *s, AioContext *old_context)
+{
     aio_set_event_notifier(old_context, &s->e, false, NULL);
     qemu_bh_delete(s->completion_bh);
 }
 
-void laio_attach_aio_context(void *s_, AioContext *new_context)
+void laio_attach_aio_context(LinuxAioState *s, AioContext *new_context)
 {
-    struct qemu_laio_state *s = s_;
-
     s->completion_bh = aio_bh_new(new_context, qemu_laio_completion_bh, s);
     aio_set_event_notifier(new_context, &s->e, false,
                            qemu_laio_completion_cb);
 }
 
-void *laio_init(void)
+LinuxAioState *laio_init(void)
 {
-    struct qemu_laio_state *s;
+    LinuxAioState *s;
 
     s = g_malloc0(sizeof(*s));
     if (event_notifier_init(&s->e, false) < 0) {
@@ -325,10 +354,8 @@ out_free_state:
     return NULL;
 }
 
-void laio_cleanup(void *s_)
+void laio_cleanup(LinuxAioState *s)
 {
-    struct qemu_laio_state *s = s_;
-
     event_notifier_cleanup(&s->e);
 
     if (io_destroy(s->ctx) != 0) {

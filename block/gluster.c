@@ -247,7 +247,7 @@ static void gluster_finish_aiocb(struct glfs_fd *fd, ssize_t ret, void *arg)
     if (!ret || ret == acb->size) {
         acb->ret = 0; /* Success */
     } else if (ret < 0) {
-        acb->ret = ret; /* Read/Write failed */
+        acb->ret = -errno; /* Read/Write failed */
     } else {
         acb->ret = -EIO; /* Partial read/write - fail it */
     }
@@ -314,6 +314,23 @@ static int qemu_gluster_open(BlockDriverState *bs,  QDict *options,
         goto out;
     }
 
+#ifdef CONFIG_GLUSTERFS_XLATOR_OPT
+    /* Without this, if fsync fails for a recoverable reason (for instance,
+     * ENOSPC), gluster will dump its cache, preventing retries.  This means
+     * almost certain data loss.  Not all gluster versions support the
+     * 'resync-failed-syncs-after-fsync' key value, but there is no way to
+     * discover during runtime if it is supported (this api returns success for
+     * unknown key/value pairs) */
+    ret = glfs_set_xlator_option(s->glfs, "*-write-behind",
+                                          "resync-failed-syncs-after-fsync",
+                                          "on");
+    if (ret < 0) {
+        error_setg_errno(errp, errno, "Unable to set xlator key/value pair");
+        ret = -errno;
+        goto out;
+    }
+#endif
+
     qemu_gluster_parse_flags(bdrv_flags, &open_flags);
 
     s->fd = glfs_open(s->glfs, gconf->image, open_flags);
@@ -365,6 +382,16 @@ static int qemu_gluster_reopen_prepare(BDRVReopenState *state,
         ret = -errno;
         goto exit;
     }
+
+#ifdef CONFIG_GLUSTERFS_XLATOR_OPT
+    ret = glfs_set_xlator_option(reop_s->glfs, "*-write-behind",
+                                 "resync-failed-syncs-after-fsync", "on");
+    if (ret < 0) {
+        error_setg_errno(errp, errno, "Unable to set xlator key/value pair");
+        ret = -errno;
+        goto exit;
+    }
+#endif
 
     reop_s->fd = glfs_open(reop_s->glfs, gconf->image, open_flags);
     if (reop_s->fd == NULL) {
@@ -427,14 +454,12 @@ static void qemu_gluster_reopen_abort(BDRVReopenState *state)
 }
 
 #ifdef CONFIG_GLUSTERFS_ZEROFILL
-static coroutine_fn int qemu_gluster_co_write_zeroes(BlockDriverState *bs,
-        int64_t sector_num, int nb_sectors, BdrvRequestFlags flags)
+static coroutine_fn int qemu_gluster_co_pwrite_zeroes(BlockDriverState *bs,
+        int64_t offset, int size, BdrvRequestFlags flags)
 {
     int ret;
     GlusterAIOCB acb;
     BDRVGlusterState *s = bs->opaque;
-    off_t size = nb_sectors * BDRV_SECTOR_SIZE;
-    off_t offset = sector_num * BDRV_SECTOR_SIZE;
 
     acb.size = size;
     acb.ret = 0;
@@ -589,6 +614,17 @@ static coroutine_fn int qemu_gluster_co_writev(BlockDriverState *bs,
     return qemu_gluster_co_rw(bs, sector_num, nb_sectors, qiov, 1);
 }
 
+static void qemu_gluster_close(BlockDriverState *bs)
+{
+    BDRVGlusterState *s = bs->opaque;
+
+    if (s->fd) {
+        glfs_close(s->fd);
+        s->fd = NULL;
+    }
+    glfs_fini(s->glfs);
+}
+
 static coroutine_fn int qemu_gluster_co_flush_to_disk(BlockDriverState *bs)
 {
     int ret;
@@ -602,11 +638,35 @@ static coroutine_fn int qemu_gluster_co_flush_to_disk(BlockDriverState *bs)
 
     ret = glfs_fsync_async(s->fd, gluster_finish_aiocb, &acb);
     if (ret < 0) {
-        return -errno;
+        ret = -errno;
+        goto error;
     }
 
     qemu_coroutine_yield();
+    if (acb.ret < 0) {
+        ret = acb.ret;
+        goto error;
+    }
+
     return acb.ret;
+
+error:
+    /* Some versions of Gluster (3.5.6 -> 3.5.8?) will not retain its cache
+     * after a fsync failure, so we have no way of allowing the guest to safely
+     * continue.  Gluster versions prior to 3.5.6 don't retain the cache
+     * either, but will invalidate the fd on error, so this is again our only
+     * option.
+     *
+     * The 'resync-failed-syncs-after-fsync' xlator option for the
+     * write-behind cache will cause later gluster versions to retain its
+     * cache after error, so long as the fd remains open.  However, we
+     * currently have no way of knowing if this option is supported.
+     *
+     * TODO: Once gluster provides a way for us to determine if the option
+     * is supported, bypass the closure and setting drv to NULL.  */
+    qemu_gluster_close(bs);
+    bs->drv = NULL;
+    return ret;
 }
 
 #ifdef CONFIG_GLUSTERFS_DISCARD
@@ -661,17 +721,6 @@ static int64_t qemu_gluster_allocated_file_size(BlockDriverState *bs)
     }
 }
 
-static void qemu_gluster_close(BlockDriverState *bs)
-{
-    BDRVGlusterState *s = bs->opaque;
-
-    if (s->fd) {
-        glfs_close(s->fd);
-        s->fd = NULL;
-    }
-    glfs_fini(s->glfs);
-}
-
 static int qemu_gluster_has_zero_init(BlockDriverState *bs)
 {
     /* GlusterFS volume could be backed by a block device */
@@ -718,7 +767,7 @@ static BlockDriver bdrv_gluster = {
     .bdrv_co_discard              = qemu_gluster_co_discard,
 #endif
 #ifdef CONFIG_GLUSTERFS_ZEROFILL
-    .bdrv_co_write_zeroes         = qemu_gluster_co_write_zeroes,
+    .bdrv_co_pwrite_zeroes        = qemu_gluster_co_pwrite_zeroes,
 #endif
     .create_opts                  = &qemu_gluster_create_opts,
 };
@@ -745,7 +794,7 @@ static BlockDriver bdrv_gluster_tcp = {
     .bdrv_co_discard              = qemu_gluster_co_discard,
 #endif
 #ifdef CONFIG_GLUSTERFS_ZEROFILL
-    .bdrv_co_write_zeroes         = qemu_gluster_co_write_zeroes,
+    .bdrv_co_pwrite_zeroes        = qemu_gluster_co_pwrite_zeroes,
 #endif
     .create_opts                  = &qemu_gluster_create_opts,
 };
@@ -772,7 +821,7 @@ static BlockDriver bdrv_gluster_unix = {
     .bdrv_co_discard              = qemu_gluster_co_discard,
 #endif
 #ifdef CONFIG_GLUSTERFS_ZEROFILL
-    .bdrv_co_write_zeroes         = qemu_gluster_co_write_zeroes,
+    .bdrv_co_pwrite_zeroes        = qemu_gluster_co_pwrite_zeroes,
 #endif
     .create_opts                  = &qemu_gluster_create_opts,
 };
@@ -799,7 +848,7 @@ static BlockDriver bdrv_gluster_rdma = {
     .bdrv_co_discard              = qemu_gluster_co_discard,
 #endif
 #ifdef CONFIG_GLUSTERFS_ZEROFILL
-    .bdrv_co_write_zeroes         = qemu_gluster_co_write_zeroes,
+    .bdrv_co_pwrite_zeroes        = qemu_gluster_co_pwrite_zeroes,
 #endif
     .create_opts                  = &qemu_gluster_create_opts,
 };

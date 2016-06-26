@@ -21,7 +21,6 @@
 
 #include "qemu/osdep.h"
 #include <sys/ioctl.h>
-#include <sys/mman.h>
 #include <sys/uio.h>
 
 #include "hw/hw.h"
@@ -554,9 +553,8 @@ static int ioreq_runio_qemu_aio(struct ioreq *ioreq)
         block_acct_start(blk_get_stats(blkdev->blk), &ioreq->acct,
                          ioreq->v.size, BLOCK_ACCT_READ);
         ioreq->aio_inflight++;
-        blk_aio_readv(blkdev->blk, ioreq->start / BLOCK_SIZE,
-                      &ioreq->v, ioreq->v.size / BLOCK_SIZE,
-                      qemu_aio_complete, ioreq);
+        blk_aio_preadv(blkdev->blk, ioreq->start, &ioreq->v, 0,
+                       qemu_aio_complete, ioreq);
         break;
     case BLKIF_OP_WRITE:
     case BLKIF_OP_FLUSH_DISKCACHE:
@@ -569,9 +567,8 @@ static int ioreq_runio_qemu_aio(struct ioreq *ioreq)
                          ioreq->req.operation == BLKIF_OP_WRITE ?
                          BLOCK_ACCT_WRITE : BLOCK_ACCT_FLUSH);
         ioreq->aio_inflight++;
-        blk_aio_writev(blkdev->blk, ioreq->start / BLOCK_SIZE,
-                       &ioreq->v, ioreq->v.size / BLOCK_SIZE,
-                       qemu_aio_complete, ioreq);
+        blk_aio_pwritev(blkdev->blk, ioreq->start, &ioreq->v, 0,
+                        qemu_aio_complete, ioreq);
         break;
     case BLKIF_OP_DISCARD:
     {
@@ -681,6 +678,8 @@ static int blk_get_request(struct XenBlkDev *blkdev, struct ioreq *ioreq, RING_I
                              RING_GET_REQUEST(&blkdev->rings.x86_64_part, rc));
         break;
     }
+    /* Prevent the compiler from accessing the on-ring fields instead. */
+    barrier();
     return 0;
 }
 

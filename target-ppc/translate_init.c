@@ -31,28 +31,12 @@
 #include "qemu/error-report.h"
 #include "qapi/visitor.h"
 #include "hw/qdev-properties.h"
+#include "hw/ppc/ppc.h"
 
 //#define PPC_DUMP_CPU
 //#define PPC_DEBUG_SPR
 //#define PPC_DUMP_SPR_ACCESSES
 /* #define USE_APPLE_GDB */
-
-/* For user-mode emulation, we don't emulate any IRQ controller */
-#if defined(CONFIG_USER_ONLY)
-#define PPC_IRQ_INIT_FN(name)                                                 \
-static inline void glue(glue(ppc, name),_irq_init) (CPUPPCState *env)         \
-{                                                                             \
-}
-#else
-#define PPC_IRQ_INIT_FN(name)                                                 \
-void glue(glue(ppc, name),_irq_init) (CPUPPCState *env);
-#endif
-
-PPC_IRQ_INIT_FN(40x);
-PPC_IRQ_INIT_FN(6xx);
-PPC_IRQ_INIT_FN(970);
-PPC_IRQ_INIT_FN(POWER7);
-PPC_IRQ_INIT_FN(e500);
 
 /* Generic callbacks:
  * do nothing but store/retrieve spr value
@@ -1195,23 +1179,32 @@ static void gen_spr_amr(CPUPPCState *env, bool has_iamr)
 }
 #endif /* TARGET_PPC64 */
 
+#ifndef CONFIG_USER_ONLY
+static void spr_read_thrm(DisasContext *ctx, int gprn, int sprn)
+{
+    gen_helper_fixup_thrm(cpu_env);
+    gen_load_spr(cpu_gpr[gprn], sprn);
+    spr_load_dump_spr(sprn);
+}
+#endif /* !CONFIG_USER_ONLY */
+
 static void gen_spr_thrm (CPUPPCState *env)
 {
     /* Thermal management */
     /* XXX : not implemented */
     spr_register(env, SPR_THRM1, "THRM1",
                  SPR_NOACCESS, SPR_NOACCESS,
-                 &spr_read_generic, &spr_write_generic,
+                 &spr_read_thrm, &spr_write_generic,
                  0x00000000);
     /* XXX : not implemented */
     spr_register(env, SPR_THRM2, "THRM2",
                  SPR_NOACCESS, SPR_NOACCESS,
-                 &spr_read_generic, &spr_write_generic,
+                 &spr_read_thrm, &spr_write_generic,
                  0x00000000);
     /* XXX : not implemented */
     spr_register(env, SPR_THRM3, "THRM3",
                  SPR_NOACCESS, SPR_NOACCESS,
-                 &spr_read_generic, &spr_write_generic,
+                 &spr_read_thrm, &spr_write_generic,
                  0x00000000);
 }
 
@@ -3187,18 +3180,30 @@ static void init_excp_POWER7 (CPUPPCState *env)
     env->excp_vectors[POWERPC_EXCP_HDECR]    = 0x00000980;
     env->excp_vectors[POWERPC_EXCP_SYSCALL]  = 0x00000C00;
     env->excp_vectors[POWERPC_EXCP_TRACE]    = 0x00000D00;
+    env->excp_vectors[POWERPC_EXCP_HDSI]     = 0x00000E00;
+    env->excp_vectors[POWERPC_EXCP_HISI]     = 0x00000E20;
+    env->excp_vectors[POWERPC_EXCP_HV_EMU]   = 0x00000E40;
+    env->excp_vectors[POWERPC_EXCP_HV_MAINT] = 0x00000E60;
     env->excp_vectors[POWERPC_EXCP_PERFM]    = 0x00000F00;
     env->excp_vectors[POWERPC_EXCP_VPU]      = 0x00000F20;
     env->excp_vectors[POWERPC_EXCP_VSXU]     = 0x00000F40;
-    env->excp_vectors[POWERPC_EXCP_FU]       = 0x00000F60;
-    env->excp_vectors[POWERPC_EXCP_IABR]     = 0x00001300;
-    env->excp_vectors[POWERPC_EXCP_MAINT]    = 0x00001600;
-    env->excp_vectors[POWERPC_EXCP_VPUA]     = 0x00001700;
-    env->excp_vectors[POWERPC_EXCP_THERM]    = 0x00001800;
     /* Hardware reset vector */
     env->hreset_vector = 0x0000000000000100ULL;
 #endif
 }
+
+static void init_excp_POWER8(CPUPPCState *env)
+{
+    init_excp_POWER7(env);
+
+#if !defined(CONFIG_USER_ONLY)
+    env->excp_vectors[POWERPC_EXCP_SDOOR]    = 0x00000A00;
+    env->excp_vectors[POWERPC_EXCP_FU]       = 0x00000F60;
+    env->excp_vectors[POWERPC_EXCP_HV_FU]    = 0x00000F80;
+    env->excp_vectors[POWERPC_EXCP_SDOOR_HV] = 0x00000E80;
+#endif
+}
+
 #endif
 
 /*****************************************************************************/
@@ -3275,7 +3280,7 @@ static void init_proc_401 (CPUPPCState *env)
     env->dcache_line_size = 32;
     env->icache_line_size = 32;
     /* Allocate hardware IRQ controller */
-    ppc40x_irq_init(env);
+    ppc40x_irq_init(ppc_env_get_cpu(env));
 
     SET_FIT_PERIOD(12, 16, 20, 24);
     SET_WDT_PERIOD(16, 20, 24, 28);
@@ -3329,7 +3334,7 @@ static void init_proc_401x2 (CPUPPCState *env)
     env->dcache_line_size = 32;
     env->icache_line_size = 32;
     /* Allocate hardware IRQ controller */
-    ppc40x_irq_init(env);
+    ppc40x_irq_init(ppc_env_get_cpu(env));
 
     SET_FIT_PERIOD(12, 16, 20, 24);
     SET_WDT_PERIOD(16, 20, 24, 28);
@@ -3381,7 +3386,7 @@ static void init_proc_401x3 (CPUPPCState *env)
     env->dcache_line_size = 32;
     env->icache_line_size = 32;
     /* Allocate hardware IRQ controller */
-    ppc40x_irq_init(env);
+    ppc40x_irq_init(ppc_env_get_cpu(env));
 
     SET_FIT_PERIOD(12, 16, 20, 24);
     SET_WDT_PERIOD(16, 20, 24, 28);
@@ -3440,7 +3445,7 @@ static void init_proc_IOP480 (CPUPPCState *env)
     env->dcache_line_size = 32;
     env->icache_line_size = 32;
     /* Allocate hardware IRQ controller */
-    ppc40x_irq_init(env);
+    ppc40x_irq_init(ppc_env_get_cpu(env));
 
     SET_FIT_PERIOD(8, 12, 16, 20);
     SET_WDT_PERIOD(16, 20, 24, 28);
@@ -3491,7 +3496,7 @@ static void init_proc_403 (CPUPPCState *env)
     env->dcache_line_size = 32;
     env->icache_line_size = 32;
     /* Allocate hardware IRQ controller */
-    ppc40x_irq_init(env);
+    ppc40x_irq_init(ppc_env_get_cpu(env));
 
     SET_FIT_PERIOD(8, 12, 16, 20);
     SET_WDT_PERIOD(16, 20, 24, 28);
@@ -3557,7 +3562,7 @@ static void init_proc_403GCX (CPUPPCState *env)
     env->dcache_line_size = 32;
     env->icache_line_size = 32;
     /* Allocate hardware IRQ controller */
-    ppc40x_irq_init(env);
+    ppc40x_irq_init(ppc_env_get_cpu(env));
 
     SET_FIT_PERIOD(8, 12, 16, 20);
     SET_WDT_PERIOD(16, 20, 24, 28);
@@ -3623,7 +3628,7 @@ static void init_proc_405 (CPUPPCState *env)
     env->dcache_line_size = 32;
     env->icache_line_size = 32;
     /* Allocate hardware IRQ controller */
-    ppc40x_irq_init(env);
+    ppc40x_irq_init(ppc_env_get_cpu(env));
 
     SET_FIT_PERIOD(8, 12, 16, 20);
     SET_WDT_PERIOD(16, 20, 24, 28);
@@ -3721,7 +3726,7 @@ static void init_proc_440EP (CPUPPCState *env)
     init_excp_BookE(env);
     env->dcache_line_size = 32;
     env->icache_line_size = 32;
-    ppc40x_irq_init(env);
+    ppc40x_irq_init(ppc_env_get_cpu(env));
 
     SET_FIT_PERIOD(12, 16, 20, 24);
     SET_WDT_PERIOD(20, 24, 28, 32);
@@ -3991,7 +3996,7 @@ static void init_proc_440x5 (CPUPPCState *env)
     init_excp_BookE(env);
     env->dcache_line_size = 32;
     env->icache_line_size = 32;
-    ppc40x_irq_init(env);
+    ppc40x_irq_init(ppc_env_get_cpu(env));
 
     SET_FIT_PERIOD(12, 16, 20, 24);
     SET_WDT_PERIOD(20, 24, 28, 32);
@@ -4413,7 +4418,7 @@ static void init_proc_G2 (CPUPPCState *env)
     env->dcache_line_size = 32;
     env->icache_line_size = 32;
     /* Allocate hardware IRQ controller */
-    ppc6xx_irq_init(env);
+    ppc6xx_irq_init(ppc_env_get_cpu(env));
 }
 
 POWERPC_FAMILY(G2)(ObjectClass *oc, void *data)
@@ -4492,7 +4497,7 @@ static void init_proc_G2LE (CPUPPCState *env)
     env->dcache_line_size = 32;
     env->icache_line_size = 32;
     /* Allocate hardware IRQ controller */
-    ppc6xx_irq_init(env);
+    ppc6xx_irq_init(ppc_env_get_cpu(env));
 }
 
 POWERPC_FAMILY(G2LE)(ObjectClass *oc, void *data)
@@ -4745,7 +4750,7 @@ static void init_proc_e300 (CPUPPCState *env)
     env->dcache_line_size = 32;
     env->icache_line_size = 32;
     /* Allocate hardware IRQ controller */
-    ppc6xx_irq_init(env);
+    ppc6xx_irq_init(ppc_env_get_cpu(env));
 }
 
 POWERPC_FAMILY(e300)(ObjectClass *oc, void *data)
@@ -5000,7 +5005,7 @@ static void init_proc_e500 (CPUPPCState *env, int version)
 
     init_excp_e200(env, ivpr_mask);
     /* Allocate hardware IRQ controller */
-    ppce500_irq_init(env);
+    ppce500_irq_init(ppc_env_get_cpu(env));
 }
 
 static void init_proc_e500v1(CPUPPCState *env)
@@ -5244,7 +5249,7 @@ static void init_proc_601 (CPUPPCState *env)
     env->dcache_line_size = 32;
     env->icache_line_size = 64;
     /* Allocate hardware IRQ controller */
-    ppc6xx_irq_init(env);
+    ppc6xx_irq_init(ppc_env_get_cpu(env));
 }
 
 POWERPC_FAMILY(601)(ObjectClass *oc, void *data)
@@ -5348,7 +5353,7 @@ static void init_proc_602 (CPUPPCState *env)
     env->dcache_line_size = 32;
     env->icache_line_size = 32;
     /* Allocate hardware IRQ controller */
-    ppc6xx_irq_init(env);
+    ppc6xx_irq_init(ppc_env_get_cpu(env));
 }
 
 POWERPC_FAMILY(602)(ObjectClass *oc, void *data)
@@ -5417,7 +5422,7 @@ static void init_proc_603 (CPUPPCState *env)
     env->dcache_line_size = 32;
     env->icache_line_size = 32;
     /* Allocate hardware IRQ controller */
-    ppc6xx_irq_init(env);
+    ppc6xx_irq_init(ppc_env_get_cpu(env));
 }
 
 POWERPC_FAMILY(603)(ObjectClass *oc, void *data)
@@ -5483,7 +5488,7 @@ static void init_proc_603E (CPUPPCState *env)
     env->dcache_line_size = 32;
     env->icache_line_size = 32;
     /* Allocate hardware IRQ controller */
-    ppc6xx_irq_init(env);
+    ppc6xx_irq_init(ppc_env_get_cpu(env));
 }
 
 POWERPC_FAMILY(603E)(ObjectClass *oc, void *data)
@@ -5543,7 +5548,7 @@ static void init_proc_604 (CPUPPCState *env)
     env->dcache_line_size = 32;
     env->icache_line_size = 32;
     /* Allocate hardware IRQ controller */
-    ppc6xx_irq_init(env);
+    ppc6xx_irq_init(ppc_env_get_cpu(env));
 }
 
 POWERPC_FAMILY(604)(ObjectClass *oc, void *data)
@@ -5626,7 +5631,7 @@ static void init_proc_604E (CPUPPCState *env)
     env->dcache_line_size = 32;
     env->icache_line_size = 32;
     /* Allocate hardware IRQ controller */
-    ppc6xx_irq_init(env);
+    ppc6xx_irq_init(ppc_env_get_cpu(env));
 }
 
 POWERPC_FAMILY(604E)(ObjectClass *oc, void *data)
@@ -5696,7 +5701,7 @@ static void init_proc_740 (CPUPPCState *env)
     env->dcache_line_size = 32;
     env->icache_line_size = 32;
     /* Allocate hardware IRQ controller */
-    ppc6xx_irq_init(env);
+    ppc6xx_irq_init(ppc_env_get_cpu(env));
 }
 
 POWERPC_FAMILY(740)(ObjectClass *oc, void *data)
@@ -5774,7 +5779,7 @@ static void init_proc_750 (CPUPPCState *env)
     env->dcache_line_size = 32;
     env->icache_line_size = 32;
     /* Allocate hardware IRQ controller */
-    ppc6xx_irq_init(env);
+    ppc6xx_irq_init(ppc_env_get_cpu(env));
 }
 
 POWERPC_FAMILY(750)(ObjectClass *oc, void *data)
@@ -5937,7 +5942,7 @@ static void init_proc_750cl (CPUPPCState *env)
     env->dcache_line_size = 32;
     env->icache_line_size = 32;
     /* Allocate hardware IRQ controller */
-    ppc6xx_irq_init(env);
+    ppc6xx_irq_init(ppc_env_get_cpu(env));
 }
 
 POWERPC_FAMILY(750cl)(ObjectClass *oc, void *data)
@@ -6057,7 +6062,7 @@ static void init_proc_750cx (CPUPPCState *env)
     env->dcache_line_size = 32;
     env->icache_line_size = 32;
     /* Allocate hardware IRQ controller */
-    ppc6xx_irq_init(env);
+    ppc6xx_irq_init(ppc_env_get_cpu(env));
 }
 
 POWERPC_FAMILY(750cx)(ObjectClass *oc, void *data)
@@ -6144,7 +6149,7 @@ static void init_proc_750fx (CPUPPCState *env)
     env->dcache_line_size = 32;
     env->icache_line_size = 32;
     /* Allocate hardware IRQ controller */
-    ppc6xx_irq_init(env);
+    ppc6xx_irq_init(ppc_env_get_cpu(env));
 }
 
 POWERPC_FAMILY(750fx)(ObjectClass *oc, void *data)
@@ -6231,7 +6236,7 @@ static void init_proc_750gx (CPUPPCState *env)
     env->dcache_line_size = 32;
     env->icache_line_size = 32;
     /* Allocate hardware IRQ controller */
-    ppc6xx_irq_init(env);
+    ppc6xx_irq_init(ppc_env_get_cpu(env));
 }
 
 POWERPC_FAMILY(750gx)(ObjectClass *oc, void *data)
@@ -6309,7 +6314,7 @@ static void init_proc_745 (CPUPPCState *env)
     env->dcache_line_size = 32;
     env->icache_line_size = 32;
     /* Allocate hardware IRQ controller */
-    ppc6xx_irq_init(env);
+    ppc6xx_irq_init(ppc_env_get_cpu(env));
 }
 
 POWERPC_FAMILY(745)(ObjectClass *oc, void *data)
@@ -6395,7 +6400,7 @@ static void init_proc_755 (CPUPPCState *env)
     env->dcache_line_size = 32;
     env->icache_line_size = 32;
     /* Allocate hardware IRQ controller */
-    ppc6xx_irq_init(env);
+    ppc6xx_irq_init(ppc_env_get_cpu(env));
 }
 
 POWERPC_FAMILY(755)(ObjectClass *oc, void *data)
@@ -6464,7 +6469,7 @@ static void init_proc_7400 (CPUPPCState *env)
     env->dcache_line_size = 32;
     env->icache_line_size = 32;
     /* Allocate hardware IRQ controller */
-    ppc6xx_irq_init(env);
+    ppc6xx_irq_init(ppc_env_get_cpu(env));
 }
 
 POWERPC_FAMILY(7400)(ObjectClass *oc, void *data)
@@ -6548,7 +6553,7 @@ static void init_proc_7410 (CPUPPCState *env)
     env->dcache_line_size = 32;
     env->icache_line_size = 32;
     /* Allocate hardware IRQ controller */
-    ppc6xx_irq_init(env);
+    ppc6xx_irq_init(ppc_env_get_cpu(env));
 }
 
 POWERPC_FAMILY(7410)(ObjectClass *oc, void *data)
@@ -6658,7 +6663,7 @@ static void init_proc_7440 (CPUPPCState *env)
     env->dcache_line_size = 32;
     env->icache_line_size = 32;
     /* Allocate hardware IRQ controller */
-    ppc6xx_irq_init(env);
+    ppc6xx_irq_init(ppc_env_get_cpu(env));
 }
 
 POWERPC_FAMILY(7440)(ObjectClass *oc, void *data)
@@ -6791,7 +6796,7 @@ static void init_proc_7450 (CPUPPCState *env)
     env->dcache_line_size = 32;
     env->icache_line_size = 32;
     /* Allocate hardware IRQ controller */
-    ppc6xx_irq_init(env);
+    ppc6xx_irq_init(ppc_env_get_cpu(env));
 }
 
 POWERPC_FAMILY(7450)(ObjectClass *oc, void *data)
@@ -6927,7 +6932,7 @@ static void init_proc_7445 (CPUPPCState *env)
     env->dcache_line_size = 32;
     env->icache_line_size = 32;
     /* Allocate hardware IRQ controller */
-    ppc6xx_irq_init(env);
+    ppc6xx_irq_init(ppc_env_get_cpu(env));
 }
 
 POWERPC_FAMILY(7445)(ObjectClass *oc, void *data)
@@ -7065,7 +7070,7 @@ static void init_proc_7455 (CPUPPCState *env)
     env->dcache_line_size = 32;
     env->icache_line_size = 32;
     /* Allocate hardware IRQ controller */
-    ppc6xx_irq_init(env);
+    ppc6xx_irq_init(ppc_env_get_cpu(env));
 }
 
 POWERPC_FAMILY(7455)(ObjectClass *oc, void *data)
@@ -7227,7 +7232,7 @@ static void init_proc_7457 (CPUPPCState *env)
     env->dcache_line_size = 32;
     env->icache_line_size = 32;
     /* Allocate hardware IRQ controller */
-    ppc6xx_irq_init(env);
+    ppc6xx_irq_init(ppc_env_get_cpu(env));
 }
 
 POWERPC_FAMILY(7457)(ObjectClass *oc, void *data)
@@ -7364,7 +7369,7 @@ static void init_proc_e600 (CPUPPCState *env)
     env->dcache_line_size = 32;
     env->icache_line_size = 32;
     /* Allocate hardware IRQ controller */
-    ppc6xx_irq_init(env);
+    ppc6xx_irq_init(ppc_env_get_cpu(env));
 }
 
 POWERPC_FAMILY(e600)(ObjectClass *oc, void *data)
@@ -8040,6 +8045,21 @@ static void gen_spr_power8_book4(CPUPPCState *env)
 #endif
 }
 
+static void gen_spr_power7_book4(CPUPPCState *env)
+{
+    /* Add a number of P7 book4 registers */
+#if !defined(CONFIG_USER_ONLY)
+    spr_register_kvm(env, SPR_ACOP, "ACOP",
+                     SPR_NOACCESS, SPR_NOACCESS,
+                     &spr_read_generic, &spr_write_generic,
+                     KVM_REG_PPC_ACOP, 0);
+    spr_register_kvm(env, SPR_BOOKS_PID, "PID",
+                     SPR_NOACCESS, SPR_NOACCESS,
+                     &spr_read_generic, &spr_write_generic,
+                     KVM_REG_PPC_PID, 0);
+#endif
+}
+
 static void init_proc_book3s_64(CPUPPCState *env, int version)
 {
     gen_spr_ne_601(env);
@@ -8082,6 +8102,9 @@ static void init_proc_book3s_64(CPUPPCState *env, int version)
         gen_spr_power6_common(env);
         gen_spr_power6_dbg(env);
     }
+    if (version == BOOK3S_CPU_POWER7) {
+        gen_spr_power7_book4(env);
+    }
     if (version >= BOOK3S_CPU_POWER8) {
         gen_spr_power8_tce_address_control(env);
         gen_spr_power8_ids(env);
@@ -8118,12 +8141,15 @@ static void init_proc_book3s_64(CPUPPCState *env, int version)
     case BOOK3S_CPU_970:
     case BOOK3S_CPU_POWER5PLUS:
         init_excp_970(env);
-        ppc970_irq_init(env);
+        ppc970_irq_init(ppc_env_get_cpu(env));
         break;
     case BOOK3S_CPU_POWER7:
-    case BOOK3S_CPU_POWER8:
         init_excp_POWER7(env);
-        ppcPOWER7_irq_init(env);
+        ppcPOWER7_irq_init(ppc_env_get_cpu(env));
+        break;
+    case BOOK3S_CPU_POWER8:
+        init_excp_POWER8(env);
+        ppcPOWER7_irq_init(ppc_env_get_cpu(env));
         break;
     default:
         g_assert_not_reached();
@@ -8354,18 +8380,55 @@ static bool ppc_pvr_match_power7(PowerPCCPUClass *pcc, uint32_t pvr)
     return false;
 }
 
+static bool cpu_has_work_POWER7(CPUState *cs)
+{
+    PowerPCCPU *cpu = POWERPC_CPU(cs);
+    CPUPPCState *env = &cpu->env;
+
+    if (cs->halted) {
+        if (!(cs->interrupt_request & CPU_INTERRUPT_HARD)) {
+            return false;
+        }
+        if ((env->pending_interrupts & (1u << PPC_INTERRUPT_EXT)) &&
+            (env->spr[SPR_LPCR] & LPCR_P7_PECE0)) {
+            return true;
+        }
+        if ((env->pending_interrupts & (1u << PPC_INTERRUPT_DECR)) &&
+            (env->spr[SPR_LPCR] & LPCR_P7_PECE1)) {
+            return true;
+        }
+        if ((env->pending_interrupts & (1u << PPC_INTERRUPT_MCK)) &&
+            (env->spr[SPR_LPCR] & LPCR_P7_PECE2)) {
+            return true;
+        }
+        if ((env->pending_interrupts & (1u << PPC_INTERRUPT_HMI)) &&
+            (env->spr[SPR_LPCR] & LPCR_P7_PECE2)) {
+            return true;
+        }
+        if (env->pending_interrupts & (1u << PPC_INTERRUPT_RESET)) {
+            return true;
+        }
+        return false;
+    } else {
+        return msr_ee && (cs->interrupt_request & CPU_INTERRUPT_HARD);
+    }
+}
+
 POWERPC_FAMILY(POWER7)(ObjectClass *oc, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
     PowerPCCPUClass *pcc = POWERPC_CPU_CLASS(oc);
+    CPUClass *cc = CPU_CLASS(oc);
 
     dc->fw_name = "PowerPC,POWER7";
     dc->desc = "POWER7";
     dc->props = powerpc_servercpu_properties;
     pcc->pvr_match = ppc_pvr_match_power7;
-    pcc->pcr_mask = PCR_COMPAT_2_05 | PCR_COMPAT_2_06;
+    pcc->pcr_mask = PCR_VEC_DIS | PCR_VSX_DIS | PCR_COMPAT_2_05;
+    pcc->pcr_supported = PCR_COMPAT_2_06 | PCR_COMPAT_2_05;
     pcc->init_proc = init_proc_POWER7;
     pcc->check_pow = check_pow_nocheck;
+    cc->has_work = cpu_has_work_POWER7;
     pcc->insns_flags = PPC_INSNS_BASE | PPC_ISEL | PPC_STRING | PPC_MFTB |
                        PPC_FLOAT | PPC_FLOAT_FSEL | PPC_FLOAT_FRES |
                        PPC_FLOAT_FSQRT | PPC_FLOAT_FRSQRTE |
@@ -8375,13 +8438,15 @@ POWERPC_FAMILY(POWER7)(ObjectClass *oc, void *data)
                        PPC_CACHE | PPC_CACHE_ICBI | PPC_CACHE_DCBZ |
                        PPC_MEM_SYNC | PPC_MEM_EIEIO |
                        PPC_MEM_TLBIE | PPC_MEM_TLBSYNC |
-                       PPC_64B | PPC_ALTIVEC |
+                       PPC_64B | PPC_64H | PPC_64BX | PPC_ALTIVEC |
                        PPC_SEGMENT_64B | PPC_SLBI |
-                       PPC_POPCNTB | PPC_POPCNTWD;
+                       PPC_POPCNTB | PPC_POPCNTWD |
+                       PPC_CILDST;
     pcc->insns_flags2 = PPC2_VSX | PPC2_DFP | PPC2_DBRX | PPC2_ISA205 |
                         PPC2_PERM_ISA206 | PPC2_DIVE_ISA206 |
                         PPC2_ATOMIC_ISA206 | PPC2_FP_CVT_ISA206 |
-                        PPC2_FP_TST_ISA206 | PPC2_FP_CVT_S64;
+                        PPC2_FP_TST_ISA206 | PPC2_FP_CVT_S64 |
+                        PPC2_PM_ISA206;
     pcc->msr_mask = (1ull << MSR_SF) |
                     (1ull << MSR_VR) |
                     (1ull << MSR_VSX) |
@@ -8434,18 +8499,63 @@ static bool ppc_pvr_match_power8(PowerPCCPUClass *pcc, uint32_t pvr)
     return false;
 }
 
+static bool cpu_has_work_POWER8(CPUState *cs)
+{
+    PowerPCCPU *cpu = POWERPC_CPU(cs);
+    CPUPPCState *env = &cpu->env;
+
+    if (cs->halted) {
+        if (!(cs->interrupt_request & CPU_INTERRUPT_HARD)) {
+            return false;
+        }
+        if ((env->pending_interrupts & (1u << PPC_INTERRUPT_EXT)) &&
+            (env->spr[SPR_LPCR] & LPCR_P8_PECE2)) {
+            return true;
+        }
+        if ((env->pending_interrupts & (1u << PPC_INTERRUPT_DECR)) &&
+            (env->spr[SPR_LPCR] & LPCR_P8_PECE3)) {
+            return true;
+        }
+        if ((env->pending_interrupts & (1u << PPC_INTERRUPT_MCK)) &&
+            (env->spr[SPR_LPCR] & LPCR_P8_PECE4)) {
+            return true;
+        }
+        if ((env->pending_interrupts & (1u << PPC_INTERRUPT_HMI)) &&
+            (env->spr[SPR_LPCR] & LPCR_P8_PECE4)) {
+            return true;
+        }
+        if ((env->pending_interrupts & (1u << PPC_INTERRUPT_DOORBELL)) &&
+            (env->spr[SPR_LPCR] & LPCR_P8_PECE0)) {
+            return true;
+        }
+        if ((env->pending_interrupts & (1u << PPC_INTERRUPT_HDOORBELL)) &&
+            (env->spr[SPR_LPCR] & LPCR_P8_PECE1)) {
+            return true;
+        }
+        if (env->pending_interrupts & (1u << PPC_INTERRUPT_RESET)) {
+            return true;
+        }
+        return false;
+    } else {
+        return msr_ee && (cs->interrupt_request & CPU_INTERRUPT_HARD);
+    }
+}
+
 POWERPC_FAMILY(POWER8)(ObjectClass *oc, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
     PowerPCCPUClass *pcc = POWERPC_CPU_CLASS(oc);
+    CPUClass *cc = CPU_CLASS(oc);
 
     dc->fw_name = "PowerPC,POWER8";
     dc->desc = "POWER8";
     dc->props = powerpc_servercpu_properties;
     pcc->pvr_match = ppc_pvr_match_power8;
-    pcc->pcr_mask = PCR_COMPAT_2_05 | PCR_COMPAT_2_06;
+    pcc->pcr_mask = PCR_TM_DIS | PCR_COMPAT_2_06 | PCR_COMPAT_2_05;
+    pcc->pcr_supported = PCR_COMPAT_2_07 | PCR_COMPAT_2_06 | PCR_COMPAT_2_05;
     pcc->init_proc = init_proc_POWER8;
     pcc->check_pow = check_pow_nocheck;
+    cc->has_work = cpu_has_work_POWER8;
     pcc->insns_flags = PPC_INSNS_BASE | PPC_ISEL | PPC_STRING | PPC_MFTB |
                        PPC_FLOAT | PPC_FLOAT_FSEL | PPC_FLOAT_FRES |
                        PPC_FLOAT_FSQRT | PPC_FLOAT_FRSQRTE |
@@ -8455,17 +8565,19 @@ POWERPC_FAMILY(POWER8)(ObjectClass *oc, void *data)
                        PPC_CACHE | PPC_CACHE_ICBI | PPC_CACHE_DCBZ |
                        PPC_MEM_SYNC | PPC_MEM_EIEIO |
                        PPC_MEM_TLBIE | PPC_MEM_TLBSYNC |
-                       PPC_64B | PPC_64BX | PPC_ALTIVEC |
+                       PPC_64B | PPC_64H | PPC_64BX | PPC_ALTIVEC |
                        PPC_SEGMENT_64B | PPC_SLBI |
-                       PPC_POPCNTB | PPC_POPCNTWD;
+                       PPC_POPCNTB | PPC_POPCNTWD |
+                       PPC_CILDST;
     pcc->insns_flags2 = PPC2_VSX | PPC2_VSX207 | PPC2_DFP | PPC2_DBRX |
                         PPC2_PERM_ISA206 | PPC2_DIVE_ISA206 |
                         PPC2_ATOMIC_ISA206 | PPC2_FP_CVT_ISA206 |
                         PPC2_FP_TST_ISA206 | PPC2_BCTAR_ISA207 |
                         PPC2_LSQ_ISA207 | PPC2_ALTIVEC_207 |
                         PPC2_ISA205 | PPC2_ISA207S | PPC2_FP_CVT_S64 |
-                        PPC2_TM;
+                        PPC2_TM | PPC2_PM_ISA206;
     pcc->msr_mask = (1ull << MSR_SF) |
+                    (1ull << MSR_SHV) |
                     (1ull << MSR_TM) |
                     (1ull << MSR_VR) |
                     (1ull << MSR_VSX) |
@@ -8504,6 +8616,7 @@ POWERPC_FAMILY(POWER8)(ObjectClass *oc, void *data)
 void cpu_ppc_set_papr(PowerPCCPU *cpu)
 {
     CPUPPCState *env = &cpu->env;
+    ppc_spr_t *lpcr = &env->spr_cb[SPR_LPCR];
     ppc_spr_t *amor = &env->spr_cb[SPR_AMOR];
 
     /* PAPR always has exception vectors in RAM not ROM. To ensure this,
@@ -8512,6 +8625,26 @@ void cpu_ppc_set_papr(PowerPCCPU *cpu)
      * We also disallow setting of MSR_HV
      */
     env->msr_mask &= ~((1ull << MSR_EP) | MSR_HVB);
+
+    /* Set emulated LPCR to not send interrupts to hypervisor. Note that
+     * under KVM, the actual HW LPCR will be set differently by KVM itself,
+     * the settings below ensure proper operations with TCG in absence of
+     * a real hypervisor
+     */
+    lpcr->default_value &= ~(LPCR_VPM0 | LPCR_VPM1 | LPCR_ISL | LPCR_KBV);
+    lpcr->default_value |= LPCR_LPES0 | LPCR_LPES1;
+
+    /* P7 and P8 has slightly different PECE bits, mostly because P8 adds
+     * bit 47 and 48 which are reserved on P7. Here we set them all, which
+     * will work as expected for both implementations
+     */
+    lpcr->default_value |= LPCR_P8_PECE0 | LPCR_P8_PECE1 | LPCR_P8_PECE2 |
+                           LPCR_P8_PECE3 | LPCR_P8_PECE4;
+
+    /* We should be followed by a CPU reset but update the active value
+     * just in case...
+     */
+    env->spr[SPR_LPCR] = lpcr->default_value;
 
     /* Set a full AMOR so guest can use the AMR as it sees fit */
     env->spr[SPR_AMOR] = amor->default_value = 0xffffffffffffffffull;
@@ -9247,6 +9380,14 @@ static void ppc_cpu_realizefn(DeviceState *dev, Error **errp)
 #if !defined(CONFIG_USER_ONLY)
     cpu->cpu_dt_id = (cs->cpu_index / smp_threads) * max_smt
         + (cs->cpu_index % smp_threads);
+
+    if (kvm_enabled() && !kvm_vcpu_id_is_valid(cpu->cpu_dt_id)) {
+        error_setg(errp, "Can't create CPU with id %d in KVM", cpu->cpu_dt_id);
+        error_append_hint(errp, "Adjust the number of cpus to %d "
+                          "or try to raise the number of threads per core\n",
+                          cpu->cpu_dt_id * smp_threads / max_smt);
+        return;
+    }
 #endif
 
     if (tcg_enabled()) {
@@ -9502,26 +9643,35 @@ int ppc_get_compat_smt_threads(PowerPCCPU *cpu)
     return ret;
 }
 
+#ifdef TARGET_PPC64
 void ppc_set_compat(PowerPCCPU *cpu, uint32_t cpu_version, Error **errp)
 {
     int ret = 0;
     CPUPPCState *env = &cpu->env;
+    PowerPCCPUClass *host_pcc;
 
     cpu->cpu_version = cpu_version;
 
     switch (cpu_version) {
     case CPU_POWERPC_LOGICAL_2_05:
-        env->spr[SPR_PCR] = PCR_COMPAT_2_05;
+        env->spr[SPR_PCR] = PCR_TM_DIS | PCR_VSX_DIS | PCR_COMPAT_2_07 |
+                            PCR_COMPAT_2_06 | PCR_COMPAT_2_05;
         break;
     case CPU_POWERPC_LOGICAL_2_06:
-        env->spr[SPR_PCR] = PCR_COMPAT_2_06;
-        break;
     case CPU_POWERPC_LOGICAL_2_06_PLUS:
-        env->spr[SPR_PCR] = PCR_COMPAT_2_06;
+        env->spr[SPR_PCR] = PCR_TM_DIS | PCR_COMPAT_2_07 | PCR_COMPAT_2_06;
+        break;
+    case CPU_POWERPC_LOGICAL_2_07:
+        env->spr[SPR_PCR] = PCR_COMPAT_2_07;
         break;
     default:
         env->spr[SPR_PCR] = 0;
         break;
+    }
+
+    host_pcc = kvm_ppc_get_host_cpu_class();
+    if (host_pcc) {
+        env->spr[SPR_PCR] &= host_pcc->pcr_mask;
     }
 
     if (kvm_enabled()) {
@@ -9532,6 +9682,7 @@ void ppc_set_compat(PowerPCCPU *cpu, uint32_t cpu_version, Error **errp)
         }
     }
 }
+#endif
 
 static gint ppc_cpu_compare_class_pvr(gconstpointer a, gconstpointer b)
 {
@@ -9862,10 +10013,7 @@ static void ppc_cpu_reset(CPUState *s)
     pcc->parent_reset(s);
 
     msr = (target_ulong)0;
-    if (0) {
-        /* XXX: find a suitable condition to enable the hypervisor mode */
-        msr |= (target_ulong)MSR_HVB;
-    }
+    msr |= (target_ulong)MSR_HVB;
     msr |= (target_ulong)0 << MSR_AP; /* TO BE CHECKED */
     msr |= (target_ulong)0 << MSR_SA; /* TO BE CHECKED */
     msr |= (target_ulong)1 << MSR_EP;
@@ -9965,6 +10113,19 @@ static void ppc_cpu_initfn(Object *obj)
     env->flags = pcc->flags;
     env->bfd_mach = pcc->bfd_mach;
     env->check_pow = pcc->check_pow;
+
+    /* Mark HV mode as supported if the CPU has an MSR_HV bit
+     * in the msr_mask. The mask can later be cleared by PAPR
+     * mode but the hv mode support will remain, thus enforcing
+     * that we cannot use priv. instructions in guest in PAPR
+     * mode. For 970 we currently simply don't set HV in msr_mask
+     * thus simulating an "Apple mode" 970. If we ever want to
+     * support 970 HV mode, we'll have to add a processor attribute
+     * of some sort.
+     */
+#if !defined(CONFIG_USER_ONLY)
+    env->has_hv_mode = !!(env->msr_mask & MSR_HVB);
+#endif
 
 #if defined(TARGET_PPC64)
     if (pcc->sps) {

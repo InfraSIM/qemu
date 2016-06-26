@@ -24,7 +24,8 @@
 #include <hw/virtio/virtio-rng.h>
 #include <hw/virtio/virtio-bus.h>
 
-#include "css.h"
+#include <hw/s390x/s390_flic.h>
+#include <hw/s390x/css.h>
 
 #define VIRTUAL_CSSID 0xfe
 
@@ -79,7 +80,7 @@ typedef struct VirtIOCCWDeviceClass {
 struct VirtioCcwDevice {
     DeviceState parent_obj;
     SubchDev *sch;
-    char *bus_id;
+    CssDevId bus_id;
     int revision;
     uint32_t max_rev;
     VirtioBusState bus;
