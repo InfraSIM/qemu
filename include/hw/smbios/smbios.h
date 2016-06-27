@@ -15,7 +15,7 @@
 
 #include "qemu/option.h"
 
-#define SMBIOS_MAX_TYPE 127
+#define SMBIOS_MAX_TYPE 255
 
 /* memory area description, used by type 19 table */
 struct smbios_phys_mem_area {

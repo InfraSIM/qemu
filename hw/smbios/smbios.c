@@ -945,9 +945,9 @@ void smbios_entry_add(QemuOpts *opts)
 
     val = qemu_opt_get(opts, "file");
     if (val) {
-        struct smbios_structure_header *header;
         int size;
         struct smbios_table *table; /* legacy mode only */
+        uint8_t *data = NULL, *buf = NULL;
 
         qemu_opts_validate(opts, qemu_smbios_file_opts, &error_fatal);
 
@@ -957,60 +957,99 @@ void smbios_entry_add(QemuOpts *opts)
             exit(1);
         }
 
-        /*
-         * NOTE: standard double '\0' terminator expected, per smbios spec.
-         * (except in legacy mode, where the second '\0' is implicit and
-         *  will be inserted by the BIOS).
-         */
-        smbios_tables = g_realloc(smbios_tables, smbios_tables_len + size);
-        header = (struct smbios_structure_header *)(smbios_tables +
-                                                    smbios_tables_len);
-
-        if (load_image(val, (uint8_t *)header) != size) {
+        data = g_malloc(size);
+        if (load_image(val, data) != size) {
             error_report("Failed to load SMBIOS file %s", val);
             exit(1);
         }
 
-        if (test_bit(header->type, have_fields_bitmap)) {
-            error_report("can't load type %d struct, fields already specified!",
-                         header->type);
-            exit(1);
-        }
-        set_bit(header->type, have_binfile_bitmap);
+        if (memcmp(data + 0x10, "_DMI_", 5) == 0)
+            buf = data + 32;
+        else
+            buf = data;
 
-        if (header->type == 4) {
-            smbios_type4_count++;
-        }
+        /* The following code referenced the dmi_table() in dmidecode source code. */
+        while (buf + 4 < data + size) {
+            uint8_t *next = NULL;
+            struct smbios_structure_header *header, *target;
+            int e_size = 0;
 
-        smbios_tables_len += size;
-        if (size > smbios_table_max) {
-            smbios_table_max = size;
-        }
-        smbios_table_cnt++;
+            header = (struct smbios_structure_header *)buf;
 
-        /* add a copy of the newly loaded blob to legacy smbios_entries */
-        /* NOTE: This code runs before smbios_set_defaults(), so we don't
-         *       yet know which mode (legacy vs. aggregate-table) will be
-         *       required. We therefore add the binary blob to both legacy
-         *       (smbios_entries) and aggregate (smbios_tables) tables, and
-         *       delete the one we don't need from smbios_set_defaults(),
-         *       once we know which machine version has been requested.
-         */
-        if (!smbios_entries) {
-            smbios_entries_len = sizeof(uint16_t);
-            smbios_entries = g_malloc0(smbios_entries_len);
-        }
-        smbios_entries = g_realloc(smbios_entries, smbios_entries_len +
-                                                   size + sizeof(*table));
-        table = (struct smbios_table *)(smbios_entries + smbios_entries_len);
-        table->header.type = SMBIOS_TABLE_ENTRY;
-        table->header.length = cpu_to_le16(sizeof(*table) + size);
-        memcpy(table->data, header, size);
-        smbios_entries_len += sizeof(*table) + size;
-        (*(uint16_t *)smbios_entries) =
-                cpu_to_le16(le16_to_cpu(*(uint16_t *)smbios_entries) + 1);
-        /* end: add a copy of the newly loaded blob to legacy smbios_entries */
+            if (header->length < 4) {
+                error_report("Invalid entry length (%u)\n", header->length);
+            }
 
+            if (header->type == 127)
+                break;
+
+            /* Look for the next handle */
+            next = buf + header->length;
+            while (next - buf + 1 < size && (next[0] != 0 || next[1] != 0))
+                next++;
+            next += 2;
+
+            if (header->type == 38) {
+                buf = next;
+                continue;
+            }
+
+            e_size = next - buf;
+            /*
+             * NOTE: standard double '\0' terminator expected, per smbios spec.
+             * (except in legacy mode, where the second '\0' is implicit and
+             *  will be inserted by the BIOS).
+             */
+            smbios_tables = g_realloc(smbios_tables, smbios_tables_len + e_size);
+            target = (struct smbios_structure_header *)(smbios_tables +
+                                                        smbios_tables_len);
+
+            memcpy(target, buf, e_size);
+            /* Add to smbios table */
+            if (test_bit(header->type, have_fields_bitmap)) {
+                error_report("can't load type %d struct, fields already specified!",
+                             header->type);
+                exit(1);
+            }
+            set_bit(target->type, have_binfile_bitmap);
+
+            if (target->type == 4) {
+                smbios_type4_count++;
+            }
+
+            smbios_tables_len += e_size;
+            if (e_size > smbios_table_max) {
+                smbios_table_max = e_size;
+            }
+            smbios_table_cnt++;
+
+            /* add a copy of the newly loaded blob to legacy smbios_entries */
+            /* NOTE: This code runs before smbios_set_defaults(), so we don't
+             *       yet know which mode (legacy vs. aggregate-table) will be
+             *       required. We therefore add the binary blob to both legacy
+             *       (smbios_entries) and aggregate (smbios_tables) tables, and
+             *       delete the one we don't need from smbios_set_defaults(),
+             *       once we know which machine version has been requested.
+             */
+            if (!smbios_entries) {
+                smbios_entries_len = sizeof(uint16_t);
+                smbios_entries = g_malloc0(smbios_entries_len);
+            }
+            smbios_entries = g_realloc(smbios_entries, smbios_entries_len +
+                                                       size + sizeof(*table));
+            table = (struct smbios_table *)(smbios_entries + smbios_entries_len);
+            table->header.type = SMBIOS_TABLE_ENTRY;
+            table->header.length = cpu_to_le16(sizeof(*table) + e_size);
+            memcpy(table->data, target, e_size);
+            smbios_entries_len += sizeof(*table) + e_size;
+            (*(uint16_t *)smbios_entries) =
+                    cpu_to_le16(le16_to_cpu(*(uint16_t *)smbios_entries) + 1);
+            /* end: add a copy of the newly loaded blob to legacy smbios_entries */
+
+            buf = next;
+
+        }
+        g_free(data);
         return;
     }
 
