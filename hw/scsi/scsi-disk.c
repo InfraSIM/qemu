@@ -88,6 +88,7 @@ struct SCSIDiskState
     char *product;
     bool tray_open;
     bool tray_locked;
+    uint32_t rotation;
 };
 
 static int scsi_handle_rw_error(SCSIDiskReq *r, int error, bool acct_failed);
@@ -730,6 +731,36 @@ static int scsi_disk_emulate_inquiry(SCSIRequest *req, uint8_t *outbuf)
             outbuf[43] = max_io_sectors & 0xff;
             break;
         }
+        case 0xb1: /* Block Device Characteristics */
+        {
+            if (s->qdev.type == TYPE_ROM) {
+                DPRINTF("Inquiry (EVPD[%02X]) not supported for CDROM\n",
+                        page_code);
+                return -1;
+            }
+
+            buflen = 64;
+            memset(outbuf + 4, 0 , buflen - 4);
+
+            /* Medium Rotation Rate */
+            /* 0000h - Medium Rotation Rate is not supported */
+            /* 0001h - Non-rotating Medium */
+            /* 0002h to 0400h - Reserved */
+            /* 0401h to FFFEh - Nominal meidum rotation rate in rpm */
+            outbuf[4] = (s->rotation >> 8) & 0xff;
+            outbuf[5] = s->rotation & 0xff;
+            outbuf[6] = 0x0;
+
+            /* Nominal form factor */
+            /* 0h - nominal form factore is not reported */
+            /* 1h - 5.25inch, 2h - 3.5inch, 3h - 2.5inch */
+            /* 4h - 1.8inch, 5h - less than 1.8inch*/
+            /* All others - Reserved */
+            outbuf[7] = 0x3;
+
+            memset(outbuf + 8, 52, buflen - 8);
+            break;
+        }
         case 0xb2: /* thin provisioning */
         {
             buflen = 8;
@@ -1116,9 +1147,9 @@ static int mode_sense_page(SCSIDiskState *s, int page, uint8_t **p_outbuf,
         p[12] = 0xff;
         p[13] =  0xff;
         p[14] = 0xff;
-        /* Medium rotation rate [rpm], 5400 rpm */
-        p[18] = (5400 >> 8) & 0xff;
-        p[19] = 5400 & 0xff;
+        /* Medium rotation rate [rpm], default 7200 rpm */
+        p[18] = (s->rotation >> 8) & 0xff;
+        p[19] = s->rotation & 0xff;
         break;
 
     case MODE_PAGE_FLEXIBLE_DISK_GEOMETRY:
@@ -1153,9 +1184,9 @@ static int mode_sense_page(SCSIDiskState *s, int page, uint8_t **p_outbuf,
         p[17] = 1;
         /* Motor off delay [0.1s], 0.1s */
         p[18] = 1;
-        /* Medium rotation rate [rpm], 5400 rpm */
-        p[26] = (5400 >> 8) & 0xff;
-        p[27] = 5400 & 0xff;
+        /* Medium rotation rate [rpm], 7200 rpm */
+        p[26] = (s->rotation >> 8) & 0xff;
+        p[27] = s->rotation & 0xff;
         break;
 
     case MODE_PAGE_CACHING:
@@ -2676,6 +2707,8 @@ static Property scsi_hd_properties[] = {
     DEFINE_PROP_UINT64("max_io_size", SCSIDiskState, max_io_size,
                        DEFAULT_MAX_IO_SIZE),
     DEFINE_BLOCK_CHS_PROPERTIES(SCSIDiskState, qdev.conf),
+    DEFINE_PROP_UINT32("rotation", SCSIDiskState, rotation, 7200),
+    DEFINE_PROP_UINT32("slot_number", SCSIDiskState, qdev.slot_number, 0),
     DEFINE_PROP_END_OF_LIST(),
 };
 
@@ -2790,6 +2823,7 @@ static Property scsi_disk_properties[] = {
                        DEFAULT_MAX_UNMAP_SIZE),
     DEFINE_PROP_UINT64("max_io_size", SCSIDiskState, max_io_size,
                        DEFAULT_MAX_IO_SIZE),
+    DEFINE_PROP_UINT32("rotation", SCSIDiskState, rotation, 7200),
     DEFINE_PROP_END_OF_LIST(),
 };
 
