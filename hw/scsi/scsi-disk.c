@@ -41,6 +41,7 @@ do { printf("scsi-disk: " fmt , ## __VA_ARGS__); } while (0)
 #include "qemu/cutils.h"
 #include "trace.h"
 #include "qemu/timer.h"
+#include "hw/loader.h"
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -98,6 +99,8 @@ struct SCSIDiskState
     uint64_t format_time_emulation;
     double progress;
     uint8_t format_in_progress;
+    char *page_file;
+    uint8_t* page_buffer;
 };
 
 static int scsi_handle_rw_error(SCSIDiskReq *r, int error, bool acct_failed);
@@ -570,12 +573,68 @@ static uint8_t *scsi_get_buf(SCSIRequest *req)
     return (uint8_t *)r->iov.iov_base;
 }
 
+typedef struct __page
+{
+    uint8_t page_code;
+    uint8_t sub_page_code;
+    uint16_t offset;
+    uint16_t length;
+}PageIndex;
+
+typedef struct __pages
+{
+    uint16_t number;
+    PageIndex pi;
+}PagesHeader;
+
+typedef struct __file
+{
+    uint16_t inquiry_offset;
+    uint16_t mode_offset;
+}FileHeader;
+
+static int page_load(SCSIDiskState *s, int page, int sub_page, uint8_t **p_outbuf,
+                                int page_type, int *available_space)
+{
+
+    int length = -1;
+    FileHeader* header = (FileHeader*)s->page_buffer;
+    PagesHeader* p_pg_header = (PagesHeader*)(s->page_buffer + *(&(header->inquiry_offset) + page_type));  // get ptr to Pages Header.
+    PageIndex* index = &p_pg_header->pi;                                             // get the index to first page.
+    for (int i = 0; i< p_pg_header->number; i++){
+        if (page == index->page_code && sub_page == index->sub_page_code) {             // find the correct page and sub page.
+            if (index->length > *available_space) {
+                break;
+            }
+            memcpy(*p_outbuf, (uint8_t*)p_pg_header + index->offset, index->length);
+            length = index->length;
+            *available_space -= length;
+            *p_outbuf += length;
+            break;
+        }
+        ++index;
+    }
+    return length;
+}
+
 static int scsi_disk_emulate_inquiry(SCSIRequest *req, uint8_t *outbuf)
 {
     SCSIDiskState *s = DO_UPCAST(SCSIDiskState, qdev, req->dev);
+    SCSIDiskReq *r = DO_UPCAST(SCSIDiskReq, req, req);
+
     int buflen = 0;
     int start;
-
+    if (s->page_buffer) {
+        int available_space = r->buflen;
+        if (req->cmd.buf[1] & 0x1) {
+            // VPD Page
+            buflen = page_load(s, req->cmd.buf[2], 0, &outbuf, 0, &available_space);
+        } else {
+            // Standard Page
+            buflen = page_load(s, 0xff, 0xff, &outbuf, 0, &available_space);
+        }
+        return buflen;
+    }
     if (req->cmd.buf[1] & 0x1) {
         /* Vital product data */
         uint8_t page_code = req->cmd.buf[2];
@@ -1262,12 +1321,13 @@ static int scsi_disk_emulate_mode_sense(SCSIDiskReq *r, uint8_t *outbuf)
     SCSIDiskState *s = DO_UPCAST(SCSIDiskState, qdev, r->req.dev);
     uint64_t nb_sectors;
     bool dbd;
-    int page, buflen, ret, page_control;
+    int page, buflen, ret, page_control, sub_page;
     uint8_t *p;
     uint8_t dev_specific_param;
 
     dbd = (r->req.cmd.buf[1] & 0x8) != 0;
     page = r->req.cmd.buf[2] & 0x3f;
+    sub_page = (r->req.cmd.buf[3]);
     page_control = (r->req.cmd.buf[2] & 0xc0) >> 6;
     DPRINTF("Mode Sense(%d) (page %d, xfer %zd, page_control %d)\n",
         (r->req.cmd.buf[0] == MODE_SENSE) ? 6 : 10, page, r->req.cmd.xfer, page_control);
@@ -1326,16 +1386,41 @@ static int scsi_disk_emulate_mode_sense(SCSIDiskReq *r, uint8_t *outbuf)
         return -1;
     }
 
-    if (page == 0x3f) {
-        for (page = 0; page <= 0x3e; page++) {
-            mode_sense_page(s, page, &p, page_control);
+    if (s->page_buffer) {
+        int available_space = r->buflen;
+        if (page == 0x3f || sub_page == 0xff) {
+            int page_start = 0, page_end = 0x3e;
+            int subpage_start = 0, subpage_end = 0xfe;
+            if (page != 0x3f) page_start = page_end = page;
+            if (sub_page != 0xff) subpage_start = subpage_end = sub_page;
+            for (page = page_start; page <= page_end; page++) {
+                for (sub_page = subpage_start; sub_page <= subpage_end; sub_page++) {
+                    page_load(s, page, sub_page, &p, 1, &available_space);
+                }
+            }
+        } else
+        {
+            ret = page_load(s, page, sub_page, &p, 1, &available_space);
+            if (ret == -1) {
+                return -1;
+            }
         }
-    } else {
-        ret = mode_sense_page(s, page, &p, page_control);
-        if (ret == -1) {
-            return -1;
+    } else
+    {
+        if (page == 0x3f) {
+            for (page = 0; page <= 0x3e; page++) {
+                mode_sense_page(s, page, &p, page_control);
+            }
+        } else {
+            ret = mode_sense_page(s, page, &p, page_control);
+            if (ret == -1) {
+                return -1;
+            }
         }
     }
+
+
+
 
     buflen = p - outbuf;
     /*
@@ -2531,6 +2616,20 @@ static void scsi_hd_realize(SCSIDevice *dev, Error **errp)
     if (!s->product) {
         s->product = g_strdup("QEMU HARDDISK");
     }
+
+    if (s->page_file) {
+        uint8_t checksum = 0;
+        int size = get_image_size(s->page_file);
+        uint8_t* ptr = s->page_buffer = g_malloc(size);
+        load_image(s->page_file, s->page_buffer);
+        for (; size > 0; --size) {
+            checksum += *ptr++;
+        }
+        if (checksum != 0) {
+            g_free(s->page_buffer);
+            s->page_buffer = 0;
+        }
+    }
     scsi_realize(&s->qdev, errp);
 }
 
@@ -2844,6 +2943,7 @@ static Property scsi_hd_properties[] = {
     DEFINE_PROP_UINT32("rotation", SCSIDiskState, rotation, 7200),
     DEFINE_PROP_UINT32("slot_number", SCSIDiskState, qdev.slot_number, 0),
     DEFINE_PROP_UINT64("format_time_emulation", SCSIDiskState, format_time_emulation, 120),
+    DEFINE_PROP_STRING("page_file", SCSIDiskState, page_file),
     DEFINE_PROP_END_OF_LIST(),
 };
 
