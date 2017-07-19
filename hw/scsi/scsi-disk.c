@@ -60,6 +60,9 @@ do { printf("scsi-disk: " fmt , ## __VA_ARGS__); } while (0)
 #define DEFAULT_MAX_UNMAP_SIZE      (1 << 30)   /* 1 GB */
 #define DEFAULT_MAX_IO_SIZE         INT_MAX     /* 2 GB - 1 block */
 
+#define INQUIRY_PAGE 0
+#define MODE_PAGE 1
+
 typedef struct SCSIDiskState SCSIDiskState;
 
 typedef struct SCSIDiskReq {
@@ -573,36 +576,71 @@ static uint8_t *scsi_get_buf(SCSIRequest *req)
     return (uint8_t *)r->iov.iov_base;
 }
 
-typedef struct __page
+typedef struct PageIndex
 {
     uint8_t page_code;
     uint8_t sub_page_code;
     uint16_t offset;
     uint16_t length;
-}PageIndex;
+} PageIndex;
 
-typedef struct __pages
+typedef struct PagesHeader
 {
     uint16_t number;
-    PageIndex pi;
-}PagesHeader;
+    PageIndex first_page_index;
+} PagesHeader;
 
-typedef struct __file
+typedef struct FileHeader
 {
     uint16_t inquiry_offset;
     uint16_t mode_offset;
-}FileHeader;
+} FileHeader;
 
+/*
+ * File Structure:
++-------------------------+
++      inquiry_offset     +
+|       mode_offset       |
++-------------------------+
+| number of inquiry pages |
+|       page_index 1      |
+|       page_index 2      |
+|           ...           |
++-------------------------+
+|      inquiry page 1     |
+|      inquiry page 2     |
+|           ...           |
++-------------------------+
+|  number of  mode pages  |
+|       page_index 1      |
+|       page_index 2      |
+|           ...           |
++-------------------------+
+|       mode page 1       |
+|       mode page 2       |
+|           ...           |
++-------------------------+
+|         checksum        |
++-------------------------+
+ *
+ */
 static int page_load(SCSIDiskState *s, int page, int sub_page, uint8_t **p_outbuf,
                                 int page_type, int *available_space)
 {
 
     int length = -1;
     FileHeader* header = (FileHeader*)s->page_buffer;
-    PagesHeader* p_pg_header = (PagesHeader*)(s->page_buffer + *(&(header->inquiry_offset) + page_type));  // get ptr to Pages Header.
-    PageIndex* index = &p_pg_header->pi;                                             // get the index to first page.
+    /* get ptr to correct Pages Header according to page_type.
+       page_type==0: inquiry pages.
+       page_type==1: mode pages.
+    */
+    PagesHeader* p_pg_header = (PagesHeader*)(s->page_buffer + *(&(header->inquiry_offset) + page_type));
+    // Jump to the first page index
+    PageIndex* index = &p_pg_header->first_page_index;
+    // Go through page indices for page data
     for (int i = 0; i< p_pg_header->number; i++){
-        if (page == index->page_code && sub_page == index->sub_page_code) {             // find the correct page and sub page.
+        if (page == index->page_code && sub_page == index->sub_page_code) {
+            // check available outbuf size for safety.
             if (index->length > *available_space) {
                 break;
             }
@@ -612,6 +650,7 @@ static int page_load(SCSIDiskState *s, int page, int sub_page, uint8_t **p_outbu
             *p_outbuf += length;
             break;
         }
+        // move to next page index
         ++index;
     }
     return length;
@@ -624,14 +663,19 @@ static int scsi_disk_emulate_inquiry(SCSIRequest *req, uint8_t *outbuf)
 
     int buflen = 0;
     int start;
+    /*
+     * If page_buffer is available, i.e., the user wants to load page data
+     * from bin file, then load page content from page buffer, otherwise
+     * generate some fake pages.
+     */
     if (s->page_buffer) {
         int available_space = r->buflen;
         if (req->cmd.buf[1] & 0x1) {
             // VPD Page
-            buflen = page_load(s, req->cmd.buf[2], 0, &outbuf, 0, &available_space);
+            buflen = page_load(s, req->cmd.buf[2], 0, &outbuf, INQUIRY_PAGE, &available_space);
         } else {
             // Standard Page
-            buflen = page_load(s, 0xff, 0xff, &outbuf, 0, &available_space);
+            buflen = page_load(s, 0xff, 0xff, &outbuf, INQUIRY_PAGE, &available_space);
         }
         return buflen;
     }
@@ -1386,6 +1430,10 @@ static int scsi_disk_emulate_mode_sense(SCSIDiskReq *r, uint8_t *outbuf)
         return -1;
     }
 
+    /*
+     * If page_buffer is available, get page content from page_buffer
+     *
+     * */
     if (s->page_buffer) {
         int available_space = r->buflen;
         if (page == 0x3f || sub_page == 0xff) {
@@ -1395,12 +1443,12 @@ static int scsi_disk_emulate_mode_sense(SCSIDiskReq *r, uint8_t *outbuf)
             if (sub_page != 0xff) subpage_start = subpage_end = sub_page;
             for (page = page_start; page <= page_end; page++) {
                 for (sub_page = subpage_start; sub_page <= subpage_end; sub_page++) {
-                    page_load(s, page, sub_page, &p, 1, &available_space);
+                    page_load(s, page, sub_page, &p, MODE_PAGE, &available_space);
                 }
             }
         } else
         {
-            ret = page_load(s, page, sub_page, &p, 1, &available_space);
+            ret = page_load(s, page, sub_page, &p, MODE_PAGE, &available_space);
             if (ret == -1) {
                 return -1;
             }
