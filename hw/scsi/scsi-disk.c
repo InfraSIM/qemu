@@ -656,12 +656,33 @@ static int page_load(SCSIDiskState *s, int page, int sub_page, uint8_t **p_outbu
     return length;
 }
 
+static void insert_page_number(uint8_t page_code, uint8_t *outbuf, int *p_buflen, int *p_buflen_filled)
+{
+	/*
+	 * Insert the page codes of specific pages into VPD page numbers.
+	 */
+    int buflen = *p_buflen;
+    int buflen_filled = * p_buflen_filled;
+    for (;outbuf[buflen] < page_code && buflen < buflen_filled; ++buflen) ;
+    if (outbuf[buflen] != page_code) {
+        int tmp;
+        for (tmp = buflen_filled; tmp > buflen; --tmp) outbuf[tmp] = outbuf[tmp - 1];
+        outbuf[buflen] = page_code;
+        buflen_filled += 1;
+        buflen += 1;
+    }
+    *p_buflen = buflen;
+    *p_buflen_filled = buflen_filled;
+}
+
 static int scsi_disk_emulate_inquiry(SCSIRequest *req, uint8_t *outbuf)
 {
     SCSIDiskState *s = DO_UPCAST(SCSIDiskState, qdev, req->dev);
     SCSIDiskReq *r = DO_UPCAST(SCSIDiskReq, req, req);
 
     int buflen = 0;
+    // this variable is only used in VPD page 0x00, to record filled length
+    int buflen_filled = 0;
     int start;
     /*
      * If page_buffer is available, i.e., the user wants to load page data
@@ -669,15 +690,26 @@ static int scsi_disk_emulate_inquiry(SCSIRequest *req, uint8_t *outbuf)
      * generate some fake pages.
      */
     if (s->page_buffer) {
+        uint8_t* outbuf_bak = outbuf;
         int available_space = r->buflen;
         if (req->cmd.buf[1] & 0x1) {
-            // VPD Page
-            buflen = page_load(s, req->cmd.buf[2], 0, &outbuf, INQUIRY_PAGE, &available_space);
+            uint8_t page_code = req->cmd.buf[2];
+            if (page_code != 0x80 && page_code != 0x83 && page_code != 0xb0 && page_code != 0xb2) {
+                // VPD Page
+                buflen_filled = page_load(s, page_code, 0, &outbuf, INQUIRY_PAGE, &available_space);
+            }
         } else {
             // Standard Page
-            buflen = page_load(s, 0xff, 0xff, &outbuf, INQUIRY_PAGE, &available_space);
+            page_load(s, 0xff, 0xff, &outbuf, INQUIRY_PAGE, &available_space);
         }
-        return buflen;
+           outbuf = outbuf_bak;
+    }
+    else
+    {
+        /* already filled 5 bytes in page 0x00(available VPD list), including 4 bytes general information
+         * and page number 0x00
+         */
+        buflen_filled = 5;
     }
     if (req->cmd.buf[1] & 0x1) {
         /* Vital product data */
@@ -695,14 +727,18 @@ static int scsi_disk_emulate_inquiry(SCSIRequest *req, uint8_t *outbuf)
             DPRINTF("Inquiry EVPD[Supported pages] "
                     "buffer size %zd\n", req->cmd.xfer);
             outbuf[buflen++] = 0x00; // list of supported pages (this page)
+            // insert page number
             if (s->serial) {
-                outbuf[buflen++] = 0x80; // unit serial number
+                insert_page_number(0x80, outbuf, &buflen, &buflen_filled); // unit serial number
             }
-            outbuf[buflen++] = 0x83; // device identification
+            insert_page_number(0x83, outbuf, &buflen, &buflen_filled);  // device identification
+
             if (s->qdev.type == TYPE_DISK) {
-                outbuf[buflen++] = 0xb0; // block limits
-                outbuf[buflen++] = 0xb2; // thin provisioning
+                insert_page_number(0xb0, outbuf, &buflen, &buflen_filled);   // block limits
+                insert_page_number(0xb1, outbuf, &buflen, &buflen_filled);   // block device characteristics
+                insert_page_number(0xb2, outbuf, &buflen, &buflen_filled);   // thin provisioning
             }
+            buflen = buflen_filled;
             break;
         }
         case 0x80: /* Device serial number, optional */
@@ -1436,19 +1472,33 @@ static int scsi_disk_emulate_mode_sense(SCSIDiskReq *r, uint8_t *outbuf)
      * */
     if (s->page_buffer) {
         int available_space = r->buflen;
+        // a flag indicates it requires non runtime information.
+#define is_addtional_page(page) ((page != 0x01 && page!= 0x04 && page != 0x05 && page != 0x08))
+
         if (page == 0x3f || sub_page == 0xff) {
+            // setup the start page and end page of loop.
             int page_start = 0, page_end = 0x3e;
             int subpage_start = 0, subpage_end = 0xfe;
             if (page != 0x3f) page_start = page_end = page;
             if (sub_page != 0xff) subpage_start = subpage_end = sub_page;
+
             for (page = page_start; page <= page_end; page++) {
-                for (sub_page = subpage_start; sub_page <= subpage_end; sub_page++) {
-                    page_load(s, page, sub_page, &p, MODE_PAGE, &available_space);
+                if (is_addtional_page(page)) {
+                    for (sub_page = subpage_start; sub_page <= subpage_end; sub_page++) {
+                         page_load(s, page, sub_page, &p, MODE_PAGE, &available_space);
+                    }
+                }
+                else {
+                    mode_sense_page(s, page, &p, page_control);
                 }
             }
+
         } else
         {
-            ret = page_load(s, page, sub_page, &p, MODE_PAGE, &available_space);
+            if (is_addtional_page(page))
+                ret = page_load(s, page, sub_page, &p, MODE_PAGE, &available_space);
+            else
+                ret = mode_sense_page(s, page, &p, page_control);
             if (ret == -1) {
                 return -1;
             }
