@@ -42,9 +42,6 @@ do { printf("scsi-disk: " fmt , ## __VA_ARGS__); } while (0)
 #include "trace.h"
 #include "qemu/timer.h"
 #include "hw/loader.h"
-#ifdef _WIN32
-#include <windows.h>
-#endif
 
 #ifdef __linux
 #include <scsi/sg.h>
@@ -59,6 +56,8 @@ do { printf("scsi-disk: " fmt , ## __VA_ARGS__); } while (0)
 #define DEFAULT_DISCARD_GRANULARITY 4096
 #define DEFAULT_MAX_UNMAP_SIZE      (1 << 30)   /* 1 GB */
 #define DEFAULT_MAX_IO_SIZE         INT_MAX     /* 2 GB - 1 block */
+
+#define FORMAT_WRITE_SIZE (1 << 20) /* 1 MB */
 
 #define INQUIRY_PAGE 0
 #define MODE_PAGE 1
@@ -101,7 +100,7 @@ struct SCSIDiskState
     uint32_t rotation;
     uint64_t format_time_emulation;
     double progress;
-    uint8_t format_in_progress;
+    bool format_in_progress;
     char *page_file;
     uint8_t* page_buffer;
 };
@@ -1615,31 +1614,57 @@ static void format_unit_write_cb(void *opaque, int ret)
 
 static void *format_unit_processing(void *opaque)
 {
-    SCSIDiskState *s = opaque;
-    uint32_t i;
+    SCSIDiskReq *r = opaque;
+    SCSIDiskState *s = DO_UPCAST(SCSIDiskState, qdev, r->req.dev);
+    uint8_t * inbuf = r->iov.iov_base;
+    bool immed = inbuf[1] & 0x2;
+    uint32_t sleep_usecs = 0;
+    uint32_t remain = s->qdev.max_lba + 1;
 
-    int step = ((s->qdev.max_lba + 1) * s->qdev.blocksize) / (1024 * 1024 * s->qdev.blocksize);
-    for (i = 0; i < step; i++) {
+    if (s->qdev.max_lba + 1 > FORMAT_WRITE_SIZE) {
+        sleep_usecs = s->format_time_emulation * 1000 * 1000 / ((s->qdev.max_lba + 1) / FORMAT_WRITE_SIZE);
+    }
+
+    atomic_set(&s->progress, 0);
+    if (immed) {
+        scsi_req_complete(&r->req, GOOD);
+    }
+
+    /*
+     * FIXME: Before sending the FORMAT UNIT command, the host applicatin opens the device.
+     * When it tries to close the device by fd, it will send out a series of SCSI commands
+     * including TEST UNIT READY, READ CAPACITY, READ, etc. If format_in_progress is set to
+     * true immediately after sending out the complete respond, the host will fail to close
+     * the device, then host will try to spin up the disk and retry those commands.
+     * Yet we don't know how the real driver's behavior, we add a sleep to work around.
+     */
+    sleep(1);
+
+    atomic_set(&s->format_in_progress, true);
+
+    while (remain > 0) {
+        uint32_t write_size = MIN(FORMAT_WRITE_SIZE, remain);
         CookieStat *myc = g_malloc(sizeof(CookieStat));
         myc->state = s;
         block_acct_start(blk_get_stats(s->qdev.conf.blk),
                          &myc->cookie,
-                         1024 * 1024 * (s->qdev.blocksize / 512),
+                         write_size * (s->qdev.blocksize / 512),
                          BLOCK_ACCT_WRITE);
         blk_aio_write_zeroes(s->qdev.conf.blk,
-                             i * 1024 * 1024 * (s->qdev.blocksize /512), 1024 * 1024 * (s->qdev.blocksize / 512),
+                             s->qdev.max_lba + 1 - remain,
+                             write_size * (s->qdev.blocksize / 512),
                              0, format_unit_write_cb, myc);
-        #ifdef __linux__
-        usleep(s->format_time_emulation * 1000 * 1000 / step);
-        #endif
-        #ifdef _WIN32
-        Sleep(s->format_time_emulation * 1000 /step);
-        #endif
-        s->progress = i * 100.0 / step;
+
+        usleep(sleep_usecs);
+        remain -= write_size;
+        atomic_set(&s->progress, (s->qdev.max_lba + 1 - remain + write_size) * 100.0 / (s->qdev.max_lba + 1));
     }
 
-    s->progress = 0;
-    s->format_in_progress = 0;
+    if (!immed)
+        scsi_req_complete(&r->req, GOOD);
+
+    atomic_set(&s->progress, 100);
+    atomic_set(&s->format_in_progress, false);
     return NULL;
 }
 
@@ -1650,23 +1675,14 @@ static int scsi_disk_emulate_format_unit(SCSIDiskReq *r, uint8_t *inbuf)
 {
     SCSIDiskState *s = DO_UPCAST(SCSIDiskState, qdev, r->req.dev);
     SCSIRequest *req = &r->req;
+    QemuThread thread;
 
-    if (s->format_in_progress) {
+    if (atomic_read(&s->format_in_progress)) {
         scsi_req_complete(req, CHECK_CONDITION);
         return 0;
     }
 
-    s->format_in_progress++;
-
-    int immed = inbuf[1] & 0x2;
-    if (immed) {
-        QemuThread thread;
-        qemu_thread_create(&thread, "format_unit_thread", format_unit_processing, s, QEMU_THREAD_DETACHED);
-    } else {
-        format_unit_processing(s);
-    }
-
-    scsi_req_complete(req, GOOD);
+    qemu_thread_create(&thread, "format_unit_thread", format_unit_processing, r, QEMU_THREAD_DETACHED);
     
     return 0;
 }
@@ -2185,25 +2201,13 @@ static int32_t scsi_disk_emulate_command(SCSIRequest *req, uint8_t *buf)
     case REQUEST_SENSE:
         break;
     default:
-        if (s->format_in_progress) {
+        if (atomic_read(&s->format_in_progress)) {
             scsi_req_build_sense(req, SENSE_CODE(FORMAT_IN_PROGRESS));
             req->sense[15] = 0x80;
-            req->sense[16] = ((int)(65536 * s->progress / 100) >> 8) & 0xff;
-            req->sense[17] = (int)(65536 * s->progress / 100) & 0xff;
+            req->sense[16] = ((int)(65536 * atomic_read(&s->progress) / 100) >> 8) & 0xff;
+            req->sense[17] = (int)(65536 * atomic_read(&s->progress) / 100) & 0xff;
 
-            /*
-             * FIXME: guest os expects the first two TEST_UNIT_READY after FORMAT_UNIT
-             * to return GOOD status, otherwise it would retry multiple times. Need to
-             * figure out the correct reply mechanism.
-             */
-            if (req->cmd.buf[0] == TEST_UNIT_READY && s->format_in_progress < 3) {
-                s->format_in_progress++;
-                scsi_req_build_sense(req, SENSE_CODE(NO_SENSE));
-                scsi_req_complete(req, GOOD);
-            } else {
-                scsi_req_complete(req, CHECK_CONDITION);
-            }
-
+            scsi_req_complete(req, CHECK_CONDITION);
             return 0;
         }
         break;
@@ -2316,7 +2320,7 @@ static int32_t scsi_disk_emulate_command(SCSIRequest *req, uint8_t *buf)
     case REQUEST_SENSE:
         /* If Format Unit is in progress, return progress indicator.
          * Otherwise just return "NO SENSE".  */
-        if (s->format_in_progress) {
+        if (atomic_read(&s->format_in_progress)) {
             memset(outbuf, 0, r->buflen);
             outbuf[0] = 0x70;
             outbuf[2] = NOT_READY;
@@ -2324,8 +2328,8 @@ static int32_t scsi_disk_emulate_command(SCSIRequest *req, uint8_t *buf)
             outbuf[12] = 0x04;
             outbuf[13] = 0x04;
             outbuf[15] = 0x80;
-            outbuf[16] = ((int)(65536 * s->progress / 100) >> 8) & 0xff;
-            outbuf[17] = (int)(65536 * s->progress / 100) & 0xff;
+            outbuf[16] = ((int)(65536 * atomic_read(&s->progress) / 100) >> 8) & 0xff;
+            outbuf[17] = (int)(65536 * atomic_read(&s->progress) / 100) & 0xff;
         } else {
             scsi_build_sense(NULL, 0, outbuf, r->buflen, (req->cmd.buf[1] & 1) == 0);
         }
