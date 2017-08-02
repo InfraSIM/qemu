@@ -629,6 +629,7 @@ static int page_load(SCSIDiskState *s, int page, int sub_page, uint8_t **p_outbu
 {
 
     int length = -1;
+    int i = 0;
     FileHeader* header = (FileHeader*)s->page_buffer;
     /* get ptr to correct Pages Header according to page_type.
        page_type==0: inquiry pages.
@@ -638,7 +639,7 @@ static int page_load(SCSIDiskState *s, int page, int sub_page, uint8_t **p_outbu
     // Jump to the first page index
     PageIndex* index = &p_pg_header->first_page_index;
     // Go through page indices for page data
-    for (int i = 0; i< p_pg_header->number; i++){
+    for (i = 0; i< p_pg_header->number; i++){
         if (page == index->page_code && sub_page == index->sub_page_code) {
             // check available outbuf size for safety.
             if (index->length > *available_space) {
@@ -697,12 +698,13 @@ static int scsi_disk_emulate_inquiry(SCSIRequest *req, uint8_t *outbuf)
             if (page_code != 0x80 && page_code != 0x83 && page_code != 0xb0 && page_code != 0xb2) {
                 // VPD Page
                 buflen_filled = page_load(s, page_code, 0, &outbuf, INQUIRY_PAGE, &available_space);
+                if (buflen_filled > 0 && page_code != 0 ) return buflen_filled;
             }
         } else {
             // Standard Page
             page_load(s, 0xff, 0xff, &outbuf, INQUIRY_PAGE, &available_space);
         }
-           outbuf = outbuf_bak;
+        outbuf = outbuf_bak;
     }
     else
     {
