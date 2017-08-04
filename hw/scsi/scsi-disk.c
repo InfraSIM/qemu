@@ -1624,7 +1624,7 @@ static void *format_unit_processing(void *opaque)
     uint32_t remain = s->qdev.max_lba + 1;
 
     if (s->qdev.max_lba + 1 > FORMAT_WRITE_SIZE) {
-        sleep_usecs = s->format_time_emulation * 1000 * 1000 / ((s->qdev.max_lba + 1) / FORMAT_WRITE_SIZE);
+        sleep_usecs = s->format_time_emulation * 60 * 1000 * 1000 / ((s->qdev.max_lba + 1) / FORMAT_WRITE_SIZE);
     }
 
     atomic_set(&s->progress, 0);
@@ -3046,7 +3046,7 @@ static Property scsi_hd_properties[] = {
     DEFINE_BLOCK_CHS_PROPERTIES(SCSIDiskState, qdev.conf),
     DEFINE_PROP_UINT32("rotation", SCSIDiskState, rotation, 7200),
     DEFINE_PROP_UINT32("slot_number", SCSIDiskState, qdev.slot_number, 0),
-    DEFINE_PROP_UINT64("format_time_emulation", SCSIDiskState, format_time_emulation, 120),
+    DEFINE_PROP_UINT64("format_time_emulation", SCSIDiskState, format_time_emulation, 2),
     DEFINE_PROP_STRING("page_file", SCSIDiskState, page_file),
     DEFINE_PROP_END_OF_LIST(),
 };
