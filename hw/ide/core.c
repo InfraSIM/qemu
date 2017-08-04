@@ -61,6 +61,7 @@ static const int smart_attributes[][12] = {
 };
 
 static void set_identify_security(IDEState *s);
+static void set_identify_chksum(IDEState *s);
 
 static const struct SecurityState security_states[7] = {
     [SEC0] = { 0, 0, 0 },
@@ -189,6 +190,11 @@ static void ide_identify(IDEState *s)
         put_le16(p + 87, (1 << 14) | 0);
     }
     put_le16(p + 88, 0x3f | (1 << 13)); /* udma5 set and supported */
+    /* set estimate erase time.
+     * FIXME: Set enhanced mode and normal mode erase time to the same value. Might need to change.
+     * */
+    put_le16(p + 89, (s->erase_time_emulation / 2) | ((s->erase_time_emulation > 508 ? 1 : 0) << 15));
+    put_le16(p + 90, (s->erase_time_emulation / 2) | ((s->erase_time_emulation > 508 ? 1 : 0) << 15));
     put_le16(p + 93, 1 | (1 << 14) | 0x2000);
     /* *(p + 100) := nb_sectors       -- see ide_identify_size */
     /* *(p + 101) := nb_sectors >> 16 -- see ide_identify_size */
@@ -217,6 +223,7 @@ static void ide_identify(IDEState *s)
 fill_buffer:
     /* Set Security Feature set related values */
     set_identify_security(s);
+    set_identify_chksum(s);
     memcpy(s->io_buffer, p, sizeof(s->identify_data));
 }
 
@@ -1325,6 +1332,18 @@ static void set_identify_security(IDEState *s)
     return;
 }
 
+static void set_identify_chksum(IDEState *s)
+{
+    uint16_t i;
+    /* Calculate identify data checksum */
+    s->identify_data[510] = 0xa5;
+    s->identify_data[511] = 0x00;
+    for (i = 0; i < 511; i ++) {
+        s->identify_data[511] += s->identify_data[i];
+    }
+    s->identify_data[511] = 0x100 - s->identify_data[511];
+}
+
 static bool cmd_nop(IDEState *s, uint8_t cmd)
 {
     return true;
@@ -1688,6 +1707,9 @@ static void ide_erase_cb(void *opaque, int ret) {
 
 static bool cmd_security_erase_unit(IDEState *s, uint8_t cmd)
 {
+    uint64_t remain_size = s->nb_sectors;
+    uint32_t write_size = 1024 * 1024;
+
     /*
      * If the previous SECURITY ERASE PREPARE command didn't succeed,
      * abort the command
@@ -1728,8 +1750,6 @@ static bool cmd_security_erase_unit(IDEState *s, uint8_t cmd)
         }
     }
     /* Write binary zero to disk. */
-    uint64_t remain_size = s->nb_sectors;
-    uint32_t write_size = 1024 * 1024;
     while (remain_size > 0) {
         write_size = (remain_size - write_size) > 0 ? write_size : remain_size;
         block_acct_start(blk_get_stats(s->blk), &s->acct,
@@ -1823,10 +1843,11 @@ abort_cmd:
 
 static bool cmd_security_disable_password(IDEState *s, uint8_t cmd)
 {
+    SecurityState state = security_states[s->security_sec];
+
     s->status = READY_STAT | SEEK_STAT;
     ide_transfer_start(s, s->io_buffer, 512, ide_transfer_stop);
     ide_set_irq(s->bus);
-    SecurityState state = security_states[s->security_sec];
     /*
      * If SECURITY is not enabled, check IDENTIFIER bit in buffer.
      * If IDENTIFIER=1, compare the input password with Master Password. 

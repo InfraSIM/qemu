@@ -462,6 +462,7 @@ struct IDEState {
     int pass_attempt_counter;
     bool erase_prepare_succeed;
     bool master_pass_capability;
+    uint16_t erase_time_emulation;
 };
 
 struct IDEDMAOps {
@@ -526,6 +527,7 @@ struct IDEDevice {
     char *serial;
     char *model;
     uint64_t wwn;
+    uint16_t erase_time_emulation;
 };
 
 /* These are used for the error_status field of IDEBus */
