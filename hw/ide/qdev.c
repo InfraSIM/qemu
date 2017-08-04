@@ -186,6 +186,7 @@ static int ide_dev_initfn(IDEDevice *dev, IDEDriveKind kind)
     if (kind == IDE_HD) {
         ide_drive = DO_UPCAST(IDEDrive, dev, dev);
         s->rotation = ide_drive->rotation;
+        s->erase_time_emulation = dev->erase_time_emulation;
     }
 
     if (ide_init_drive(s, dev->conf.blk, kind,
@@ -278,11 +279,15 @@ static int ide_drive_initfn(IDEDevice *dev)
     DEFINE_PROP_STRING("model", IDEDrive, dev.model),   \
     DEFINE_PROP_UINT32("rotation", IDEDrive, rotation, 7200)
 
+#define DEFINE_IDE_HD_PROPERTIES()                      \
+    DEFINE_PROP_UINT16("erase_time_emulation", IDEDrive, dev.erase_time_emulation, 2)
+
 static Property ide_hd_properties[] = {
     DEFINE_IDE_DEV_PROPERTIES(),
     DEFINE_BLOCK_CHS_PROPERTIES(IDEDrive, dev.conf),
     DEFINE_PROP_BIOS_CHS_TRANS("bios-chs-trans",
                 IDEDrive, dev.chs_trans, BIOS_ATA_TRANSLATION_AUTO),
+    DEFINE_IDE_HD_PROPERTIES(),
     DEFINE_PROP_END_OF_LIST(),
 };
 
