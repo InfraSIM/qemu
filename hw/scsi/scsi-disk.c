@@ -911,8 +911,9 @@ static int scsi_disk_emulate_inquiry(SCSIRequest *req, uint8_t *outbuf)
                 uint8_t tmp = outbuf[0];
                 buflen = page_load(s, page_code, 0, &outbuf, INQUIRY_PAGE, &available_space);
                 outbuf[0] = tmp;
+                if (buflen > 0) break;
             }
-            if (buflen <= 0) return -1;
+            return -1;
         }
         }
         /* done with EVPD */
