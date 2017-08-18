@@ -623,6 +623,11 @@ typedef struct FileHeader
 +-------------------------+
  *
  */
+
+/**
+ * load page from bin file.
+ * return copied length. if return -1, means does not found the page and nothing copied.
+ */
 static int page_load(SCSIDiskState *s, int page, int sub_page, uint8_t **p_outbuf,
                                 int page_type, int *available_space)
 {
@@ -641,11 +646,11 @@ static int page_load(SCSIDiskState *s, int page, int sub_page, uint8_t **p_outbu
     for (i = 0; i< p_pg_header->number; i++){
         if (page == index->page_code && sub_page == index->sub_page_code) {
             // check available outbuf size for safety.
-            if (index->length > *available_space) {
-                break;
-            }
-            memcpy(*p_outbuf, (uint8_t*)p_pg_header + index->offset, index->length);
             length = index->length;
+            if (length > *available_space) {
+                length = *available_space;
+            }
+            memcpy(*p_outbuf, (uint8_t*)p_pg_header + index->offset, length);
             *available_space -= length;
             *p_outbuf += length;
             break;
@@ -656,23 +661,27 @@ static int page_load(SCSIDiskState *s, int page, int sub_page, uint8_t **p_outbu
     return length;
 }
 
-static void insert_page_number(uint8_t page_code, uint8_t *outbuf, int *p_buflen, int *p_buflen_filled)
+static void insert_inq_page_number_list(uint8_t* src, uint8_t end_page,
+                                uint8_t* outbuf, int* buflen)
 {
-	/*
-	 * Insert the page codes of specific pages into VPD page numbers.
-	 */
-    int buflen = *p_buflen;
-    int buflen_filled = * p_buflen_filled;
-    for (;outbuf[buflen] < page_code && buflen < buflen_filled; ++buflen) ;
-    if (outbuf[buflen] != page_code) {
-        int tmp;
-        for (tmp = buflen_filled; tmp > buflen; --tmp) outbuf[tmp] = outbuf[tmp - 1];
-        outbuf[buflen] = page_code;
-        buflen_filled += 1;
-        buflen += 1;
+    // safety check.
+    if (src != 0 && *buflen < 256)
+    {
+        int i = 0;
+        FileHeader* header = (FileHeader*) src;
+        PagesHeader* p_pg_header = (PagesHeader*)((uint8_t*)header + header->inquiry_offset);
+        // Jump to the first page index
+        PageIndex* index = &p_pg_header->first_page_index;
+        // get the last code as start page code.
+        uint8_t start_page = outbuf[*buflen - 1];
+        // skip the page code smaller than start page.
+        for (i = 0; i < p_pg_header->number && index->page_code <= start_page; ++i, ++index) ;
+        // copy page codes smaller than end page.
+        for (     ; i < p_pg_header->number && index->page_code <  end_page;   ++i, ++index){
+            outbuf[*buflen] = index->page_code;
+            *buflen += 1;
+        }
     }
-    *p_buflen = buflen;
-    *p_buflen_filled = buflen_filled;
 }
 
 static int scsi_disk_emulate_inquiry(SCSIRequest *req, uint8_t *outbuf)
@@ -681,37 +690,8 @@ static int scsi_disk_emulate_inquiry(SCSIRequest *req, uint8_t *outbuf)
     SCSIDiskReq *r = DO_UPCAST(SCSIDiskReq, req, req);
 
     int buflen = 0;
-    // this variable is only used in VPD page 0x00, to record filled length
-    int buflen_filled = 0;
     int start;
-    /*
-     * If page_buffer is available, i.e., the user wants to load page data
-     * from bin file, then load page content from page buffer, otherwise
-     * generate some fake pages.
-     */
-    if (s->page_buffer) {
-        uint8_t* outbuf_bak = outbuf;
-        int available_space = r->buflen;
-        if (req->cmd.buf[1] & 0x1) {
-            uint8_t page_code = req->cmd.buf[2];
-            if (page_code != 0x80 && page_code != 0x83 && page_code != 0xb0 && page_code != 0xb2) {
-                // VPD Page
-                buflen_filled = page_load(s, page_code, 0, &outbuf, INQUIRY_PAGE, &available_space);
-                if (buflen_filled > 0 && page_code != 0 ) return buflen_filled;
-            }
-        } else {
-            // Standard Page
-            page_load(s, 0xff, 0xff, &outbuf, INQUIRY_PAGE, &available_space);
-        }
-        outbuf = outbuf_bak;
-    }
-    else
-    {
-        /* already filled 5 bytes in page 0x00(available VPD list), including 4 bytes general information
-         * and page number 0x00
-         */
-        buflen_filled = 5;
-    }
+
     if (req->cmd.buf[1] & 0x1) {
         /* Vital product data */
         uint8_t page_code = req->cmd.buf[2];
@@ -730,16 +710,20 @@ static int scsi_disk_emulate_inquiry(SCSIRequest *req, uint8_t *outbuf)
             outbuf[buflen++] = 0x00; // list of supported pages (this page)
             // insert page number
             if (s->serial) {
-                insert_page_number(0x80, outbuf, &buflen, &buflen_filled); // unit serial number
+                insert_inq_page_number_list(s->page_buffer, 0x80, outbuf, &buflen);
+                outbuf[buflen++] = 0x80;    // unit serial number
             }
-            insert_page_number(0x83, outbuf, &buflen, &buflen_filled);  // device identification
+
+            insert_inq_page_number_list(s->page_buffer, 0x83, outbuf, &buflen);
+            outbuf[buflen++] = 0x83;        // device identification
 
             if (s->qdev.type == TYPE_DISK) {
-                insert_page_number(0xb0, outbuf, &buflen, &buflen_filled);   // block limits
-                insert_page_number(0xb1, outbuf, &buflen, &buflen_filled);   // block device characteristics
-                insert_page_number(0xb2, outbuf, &buflen, &buflen_filled);   // thin provisioning
+                insert_inq_page_number_list(s->page_buffer, 0xb0, outbuf, &buflen);
+                outbuf[buflen++] = 0xb0;    // block limits
+                outbuf[buflen++] = 0xb1;    // block device characteristics
+                outbuf[buflen++] = 0xb2;    // thin provisioning
             }
-            buflen = buflen_filled;
+            insert_inq_page_number_list(s->page_buffer, 0xff, outbuf, &buflen);
             break;
         }
         case 0x80: /* Device serial number, optional */
@@ -920,7 +904,17 @@ static int scsi_disk_emulate_inquiry(SCSIRequest *req, uint8_t *outbuf)
             break;
         }
         default:
+        {
+            if (s->page_buffer) {
+                // try load page data from bin file.
+                int available_space = r->buflen;
+                uint8_t tmp = outbuf[0];
+                buflen = page_load(s, page_code, 0, &outbuf, INQUIRY_PAGE, &available_space);
+                outbuf[0] = tmp;
+                if (buflen > 0) break;
+            }
             return -1;
+        }
         }
         /* done with EVPD */
         assert(buflen - start <= 255);
@@ -937,6 +931,13 @@ static int scsi_disk_emulate_inquiry(SCSIRequest *req, uint8_t *outbuf)
     buflen = req->cmd.xfer;
     if (buflen > SCSI_MAX_INQUIRY_LEN) {
         buflen = SCSI_MAX_INQUIRY_LEN;
+    }
+
+    if (s->page_buffer) {
+        // fill buffer with standard page data in bin file first.
+        int available_space = buflen;
+        uint8_t * pbuf = outbuf;
+        page_load(s, 0xff, 0xff, &pbuf, INQUIRY_PAGE, &available_space);
     }
 
     outbuf[0] = s->qdev.type & 0x1f;
@@ -956,12 +957,19 @@ static int scsi_disk_emulate_inquiry(SCSIRequest *req, uint8_t *outbuf)
     outbuf[2] = 5;
     outbuf[3] = 2 | 0x10; /* Format 2, HiSup */
 
-    if (buflen > 36) {
-        outbuf[4] = buflen - 5; /* Additional Length = (Len - 1) - 4 */
-    } else {
-        /* If the allocation length of CDB is too small,
-               the additional length is not adjusted */
-        outbuf[4] = 36 - 5;
+    // if there is no data loaded from page buffer, then set it.
+    if (s->page_buffer == 0){
+        if (buflen > 36) {
+            outbuf[4] = buflen - 5; /* Additional Length = (Len - 1) - 4 */
+        } else {
+            /* If the allocation length of CDB is too small,
+                   the additional length is not adjusted */
+            outbuf[4] = 36 - 5;
+        }
+    }
+
+    if (s->serial) {
+        memcpy(&outbuf[36], s->serial, strlen(s->serial));
     }
 
     /* Sync data transfer and TCQ.  */
